@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SDF Studio</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <canvas id="view" aria-label="3D view. Drag to rotate, scroll to zoom."></canvas>
+  <header>
+    <label for="scene">Scene</label>
+    <select id="scene"></select>
+  </header>
+  <p id="hint">Drag to rotate · Scroll to zoom · Shift-drag to pan · Double-click to reset</p>
+  <p id="error" role="alert" hidden></p>
+
+  <script src="sdf.js"></script>
+  <script src="renderer.js"></script>
+  <script src="scenes.js"></script>
+  <script>
+    const picker = document.getElementById('scene');
+    const errorBox = document.getElementById('error');
+    const showError = (message) => {
+      errorBox.textContent = message;
+      errorBox.hidden = false;
+      console.error(message);
+    };
+
+    try {
+      const viewer = new Viewer(document.getElementById('view'), showError);
+      window.viewer = viewer; // handy from the devtools console
+
+      for (const [key, scene] of Object.entries(SDF.scenes)) picker.add(new Option(scene.label, key));
+
+      const load = (key) => {
+        errorBox.hidden = true;
+        try {
+          viewer.setScene(SDF.scenes[key]);
+          picker.value = key;
+        } catch (e) {
+          showError(e.message);
+        }
+      };
+
+      picker.addEventListener('change', () => { location.hash = picker.value; });
+
+      // #car, or #car/theta/phi/dist to open at a specific view.
+      const fromHash = () => {
+        const [key, theta, phi, dist] = location.hash.slice(1).split('/');
+        load(SDF.scenes[key] ? key : 'car');
+        if (dist) {
+          const view = { theta: +theta, phi: +phi, dist: +dist };
+          Object.assign(viewer.cam, view);
+          Object.assign(viewer.goal, view);
+        }
+      };
+      addEventListener('hashchange', fromHash);
+      fromHash();
+    } catch (e) {
+      showError(e.message);
+    }
+  </script>
+</body>
+</html>

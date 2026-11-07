@@ -185,7 +185,11 @@ window.runChecks = () => {
   // leave room for the small rises from tidying overlaps; a return of the feedback
   // loop reads in the hundreds or thousands.
   for (const [k, v] of Object.entries(EN.all({ sleep: true }))) {
-    check('energy', `${k}: peak kinetic energy, times the nudge`, v.peakKE_vsNudge, v.peakKE_vsNudge < 15, '< 15');
+    // Total energy, including height, must never rise above what the nudge added.
+    // Peak kinetic energy alone cannot tell this: a nudge may tip something over, and
+    // then gravity rightly turns height into speed.
+    check('energy', `${k}: total energy rise, times the nudge`, v.peakTotalRise_vsNudge, v.peakTotalRise_vsNudge < 1, '< 1');
+    results.push({ group: 'energy', name: `${k}: peak kinetic energy, times the nudge (for reference)`, value: v.peakKE_vsNudge, pass: true, want: '' });
     check('energy', `${k}: energy created, times the nudge`, v.createdAfterNudge_vsNudge, v.createdAfterNudge_vsNudge < 100, '< 100');
   }
   {
@@ -198,6 +202,56 @@ window.runChecks = () => {
     const early = ke() / mass; for (let i = 0; i < 1800; i++) w.step(1 / 60); const late = ke() / mass;
     PHYSICS.sleepSpeed = keep;
     check('energy', 'ring pile, kinetic energy after 40 s', +late.toExponential(1), late < 0.01, '< 0.01');
+  }
+
+  // --- Liveliness: the opposite of calm. These catch over-damping, which the checks
+  // above cannot. Ideals come from conservation of momentum.
+  {
+    const ball = sphere(0.25); const cube = box(0.44, 0.44, 0.44).round(0.04);
+    const head = (asleep, speed) => {
+      const w = new PhysicsWorld({ floor: false, gravity: 0 });
+      const t = w.add(cube, { at: [0, 0, 0] }); const a = w.add(ball, { at: [-1.2, 0, 0], velocity: [speed, 0, 0] });
+      if (asleep) { t.sleeping = true; }
+      for (let f = 0; f < 150; f++) w.step(1 / 60);
+      const ideal = (1 + PHYSICS.restitution) * a.mass / (a.mass + t.mass) * speed;
+      return { got: t.v[0], ideal, kept: (a.mass * a.v[0] + t.mass * t.v[0]) / (a.mass * speed) };
+    };
+    for (const [asleep, speed] of [[false, 4], [true, 4], [false, 1], [true, 1]]) {
+      const r = head(asleep, speed); const label = `${asleep ? 'sleeping' : 'awake'} cube, ball at ${speed}`;
+      check('lively', `${label}: cube speed vs ideal`, `${r.got.toFixed(2)} / ${r.ideal.toFixed(2)}`, Math.abs(r.got - r.ideal) < 0.1 * r.ideal, 'within 10%');
+      check('lively', `${label}: momentum kept %`, Math.round(r.kept * 100), Math.abs(r.kept - 1) < 0.05, '95 to 105');
+    }
+  }
+  {
+    // A bouncy ball should rebound to about e squared of the height it fell.
+    const w = new PhysicsWorld(); const b = w.add(sphere(0.2), { at: [0, 1.2, 0], restitution: 0.8 });
+    let hit = false, top = 0, lowest = 9;
+    for (let f = 0; f < 120; f++) { w.step(1 / 60); lowest = Math.min(lowest, b.x[1]); if (b.v[1] > 0.1) hit = true; if (hit) top = Math.max(top, b.x[1]); }
+    const ratio = (top - 0.2) / (1.2 - 0.2);
+    check('lively', 'bouncy ball rebounds (height ratio)', +ratio.toFixed(2), Math.abs(ratio - 0.64) < 0.12, 'about 0.64');
+  }
+  {
+    // A row of touching balls, struck at one end: the far end should carry it on.
+    const w = new PhysicsWorld({ floor: false, gravity: 0 }); const s = sphere(0.2); const row = [];
+    for (let i = 0; i < 5; i++) row.push(w.add(s, { at: [i * 0.4, 0, 0], friction: 0, restitution: 1 }));
+    const striker = w.add(s, { at: [-1, 0, 0], velocity: [2, 0, 0], friction: 0, restitution: 1 });
+    for (let f = 0; f < 120; f++) w.step(1 / 60);
+    const last = row[row.length - 1].v[0];
+    check('lively', 'row of balls: far end moves off (speed, of 2)', +last.toFixed(2), last > 1, '> 1');
+    const total = striker.v[0] + row.reduce((s2, b) => s2 + b.v[0], 0);
+    check('lively', 'row of balls: momentum kept (of 2)', +total.toFixed(2), Math.abs(total - 2) < 0.1, '2');
+  }
+  {
+    // A break: a ball fired into a settled, sleeping group of cubes should scatter it.
+    const w = new PhysicsWorld(); const cube = box(0.4, 0.4, 0.4).round(0.03); const group = [];
+    for (let i = 0; i < 3; i++) for (let j = 0; j < 2; j++) group.push(w.add(cube, { at: [i * 0.42, 0.201, (j - 0.5) * 0.42] }));
+    for (let f = 0; f < 120; f++) w.step(1 / 60);
+    const asleep = group.every((b) => b.sleeping);
+    const start = group.map((b) => [...b.x]);
+    w.add(sphere(0.2), { at: [-1.5, 0.2, 0.21], velocity: [7, 0, 0], density: 3 });
+    for (let f = 0; f < 120; f++) w.step(1 / 60);
+    const moved = group.filter((b, i) => Math.hypot(b.x[0] - start[i][0], b.x[2] - start[i][2]) > 0.15).length;
+    check('lively', `break shot scatters a ${asleep ? 'sleeping' : 'resting'} group (cubes moved, of 6)`, moved, moved >= 3, '3 or more');
   }
   return { results, measurements: m };
 };

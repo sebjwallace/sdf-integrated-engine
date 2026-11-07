@@ -315,16 +315,16 @@ window.EN = (() => {
       const target = w.bodies[w.bodies.length - 1]; for (const b of w.bodies) w.wake(b);
       target.v = [target.v[0] + nudge, target.v[1], target.v[2]];
       const nudgeKe = .5 * target.mass * nudge * nudge;
-      e = w.totalEnergy(); const e0 = e; let peakKe = 0, created = 0, peakPE = 0, last = 0, calm = -1; const pe0 = w.bodies.reduce((s, b) => s + b.mass * w.gravity * b.x[1], 0);
+      e = w.totalEnergy(); const e0 = e; let peakKe = 0, created = 0, peakPE = 0, last = 0, calm = -1, peakTotal = e0; const pe0 = w.bodies.reduce((s, b) => s + b.mass * w.gravity * b.x[1], 0);
       let peakOthers = 0;
       for (let f = 0; f < 600; f++) {
-        w.step(1 / 60); const k = kinetic(w); peakKe = Math.max(peakKe, k); const ne = w.totalEnergy(); if (ne > e) created += ne - e; e = ne;
+        w.step(1 / 60); const k = kinetic(w); peakKe = Math.max(peakKe, k); const ne = w.totalEnergy(); if (ne > e) created += ne - e; e = ne; peakTotal = Math.max(peakTotal, ne);
         peakPE = Math.max(peakPE, w.bodies.reduce((s, b) => s + b.mass * w.gravity * b.x[1], 0) - pe0);
         for (const b of w.bodies) if (b !== target) peakOthers = Math.max(peakOthers, b.pointSpeed);
         last = k; if (k < nudgeKe * .001) { if (calm < 0) calm = f / 60; } else calm = -1;
       }
       const g = (v) => +(v / nudgeKe).toFixed(2);
-      return { fallCreatedPerMass: +(createdFall / mass).toFixed(3), stillKE: +(settledKe / mass).toExponential(1), restCreated: +(restCreated / mass).toExponential(1), peakKE_vsNudge: g(peakKe), createdAfterNudge_vsNudge: g(created), risePE_vsNudge: g(peakPE), lastKE_vsNudge: g(last), calmAt: calm < 0 ? '>10' : +calm.toFixed(1), othersPeakSpeed: +peakOthers.toFixed(2) };
+      return { fallCreatedPerMass: +(createdFall / mass).toFixed(3), stillKE: +(settledKe / mass).toExponential(1), restCreated: +(restCreated / mass).toExponential(1), peakKE_vsNudge: g(peakKe), peakTotalRise_vsNudge: g(peakTotal - e0), createdAfterNudge_vsNudge: g(created), risePE_vsNudge: g(peakPE), lastKE_vsNudge: g(last), calmAt: calm < 0 ? '>10' : +calm.toFixed(1), othersPeakSpeed: +peakOthers.toFixed(2) };
     } finally { PHYSICS.sleepSpeed = keep; }
   };
   const all = (opts) => Object.fromEntries(Object.keys(scenes).map(n => [n, test(n, opts)]));

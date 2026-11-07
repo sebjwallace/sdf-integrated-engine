@@ -38,6 +38,7 @@ const PHYSICS = {
   maxSpeed: 40,
   sleepSpeed: 0.12,
   sleepAfter: 0.6,
+  wakeImpact: 0.15,    // approach speed at which a moving body wakes a sleeping one
   stepsPerSecond: 60,
   grab: {
     stiffness: 0.12,   // fraction of the gap to the pointer closed per substep
@@ -701,7 +702,23 @@ class PhysicsWorld {
         this.collideOverlap(a, b, b.dist, seeds, contacts);
       }
     }
+    this.wakeOnImpact(contacts);
     return contacts;
+  }
+
+  // A sleeping body is treated as immovable, so it must be woken before a hit is
+  // solved, not after. Otherwise it acts like a wall: the hit is lost, and the
+  // body that hit it bounces off. Gentle touches from resting neighbours do not
+  // count, or piles would keep each other awake.
+  wakeOnImpact(contacts) {
+    for (const m of contacts) {
+      if (!m.B || m.A.sleeping === m.B.sleeping) continue;
+      const approaching = Math.max(0, ...m.contacts.map((c) => -c.vnBefore));
+      if (approaching < PHYSICS.wakeImpact) continue;
+      const resting = m.A.sleeping ? m.A : m.B;
+      this.wake(resting);
+      resting.prepare();
+    }
   }
 
   // Between searches, a contact stays on the same material point of its body.
@@ -1165,7 +1182,9 @@ class PhysicsWorld {
       if (c.lambda <= 0) continue;
       const u = this.relativeVelocity(A, B, c.rA, c.rB);
       const un = dot3(u, c.n);
-      const e = Math.abs(un) > 4 * this.gravity * h ? (B ? Math.min(A.restitution, B.restitution) : A.restitution) : 0;
+      // Judge the impact by how fast it arrived. The speed now is already about zero,
+      // because the contact stopped it, so judging by that meant nothing ever bounced.
+      const e = -c.vnBefore > 4 * this.gravity * h ? (B ? Math.min(A.restitution, B.restitution) : A.restitution) : 0;
       const change = -un + Math.max(-e * c.vnBefore, 0);
       if (Math.abs(change) < 1e-9) continue;
       const w = A.resistance(c.rA, c.n) + (B ? B.resistance(c.rB, c.n) : 0);

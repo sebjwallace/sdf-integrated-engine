@@ -309,7 +309,7 @@ const FLY_KEYS = {
   KeyW: [0, 0, 1], KeyS: [0, 0, -1], KeyA: [-1, 0, 0], KeyD: [1, 0, 0],
   KeyE: [0, 1, 0], KeyQ: [0, -1, 0],
   ShiftLeft: [0, 0, 0], ShiftRight: [0, 0, 0],  // held for speed
-  Space: [0, 0, 0],  // held to turn the head with the pointer, see look()
+  Space: [0, 0, 0],  // held to look around without moving, see look()
 };
 
 // The shapes the edit tools place. Half-sizes are in world units.
@@ -819,7 +819,7 @@ class Viewer {
       c.classList.add('dragging');
       pinch = 0;
       this.grab = null;
-      if (pointers.size > 1 || e.button !== 0 || e.shiftKey || this.keys.has('Space')) return;
+      if (pointers.size > 1 || e.button !== 0 || e.shiftKey || this.looking) return;
       if (this.tool !== 'orbit') {
         const hit = this.pickSurface(e.clientX, e.clientY);
         const edit = hit && this.addEdit(this.tool, hit);
@@ -844,9 +844,9 @@ class Viewer {
     });
     c.addEventListener('pointermove', (e) => {
       const last = pointers.get(e.pointerId);
-      // Space held: the pointer turns the head, pressed or not, so a trackpad
-      // can look around without clicking.
-      if (this.keys.has('Space') && !this.grab && !this.bodyGrab && pointers.size <= 1) {
+      // While flying or holding Space, the pointer turns the head, pressed or
+      // not, so a trackpad can steer without clicking.
+      if (this.looking && !this.grab && !this.bodyGrab && pointers.size <= 1) {
         if (last) { last[0] = e.clientX; last[1] = e.clientY; }
         this.look(e.movementX, e.movementY);
         return;
@@ -909,17 +909,23 @@ class Viewer {
       if (FLY_KEYS[e.code] && !e.metaKey && !e.ctrlKey && !e.altKey) {
         this.keys.add(e.code);
         e.preventDefault();
-        c.classList.toggle('looking', this.keys.has('Space'));
+        c.classList.toggle('looking', this.looking);
       }
     });
     addEventListener('keyup', (e) => {
       // Stops a focused button from being pressed by the space bar.
       if (e.code === 'Space' && this.keys.has('Space')) e.preventDefault();
       this.keys.delete(e.code);
-      c.classList.toggle('looking', this.keys.has('Space'));
+      c.classList.toggle('looking', this.looking);
     });
     // A key released while the window is not focused never sends keyup.
     addEventListener('blur', () => { this.keys.clear(); c.classList.remove('looking'); });
+  }
+
+  // Space or any movement key held. Shift alone is not: Shift-drag pans.
+  get looking() {
+    for (const code of this.keys) if (code === 'Space' || FLY_KEYS[code].some((v) => v)) return true;
+    return false;
   }
 
   // Turns the camera's head: it stays where it is and its orbit point swings

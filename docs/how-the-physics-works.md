@@ -1,5 +1,8 @@
 # How the physics works
 
+A short orientation. For the model and the reasoning behind each part, read
+[The physics engine, explained](physics-theory.md) before changing anything.
+
 ## The files
 
 | File | What it does |

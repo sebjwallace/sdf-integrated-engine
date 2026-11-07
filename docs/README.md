@@ -5,9 +5,15 @@ HTML, CSS and JavaScript, with no dependencies. It renders scenes by raymarching
 the GPU, and simulates rigid bodies on the CPU using nothing but the same distance
 functions. There are no meshes anywhere.
 
-Start with [How the physics works](how-the-physics-works.md). It explains the ideas,
-the files, and the traps that have caught people before. Then pick an open problem
-from the list below.
+Read these first, in this order:
+
+1. [How the physics works](how-the-physics-works.md): a short orientation. The files,
+   the core idea, and the traps that have caught people before.
+2. [The physics engine, explained](physics-theory.md): the model and the reasoning
+   behind every part of the solver, including the rules that are easy to break and
+   the tests that guard them. **Read this before changing `physics.js`.**
+
+Then pick an open problem from the list below.
 
 ## Open problems
 

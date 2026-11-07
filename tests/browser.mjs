@@ -14,8 +14,15 @@ export async function openPage({ port = 9400, timeout = 600000 } = {}) {
   const profile = mkdtempSync(join(tmpdir(), 'sdf-tests-'));
   const chrome = spawn(CHROME, ['--headless=new', `--remote-debugging-port=${port}`, `--user-data-dir=${profile}`,
     '--use-angle=metal', '--ignore-gpu-blocklist', '--window-size=1440,900', '--force-device-scale-factor=2', 'about:blank'], { stdio: 'ignore' });
-  const close = () => { chrome.kill(); setTimeout(() => rmSync(profile, { recursive: true, force: true }), 300); };
-  const watchdog = setTimeout(() => { console.error('Timed out.'); close(); process.exit(3); }, timeout);
+  // Resolves once Chrome has exited and its profile is deleted. Await it before
+  // process.exit(), or the profile (tens of MB) is left in the temp folder.
+  const exited = new Promise((r) => chrome.once('exit', r));
+  const close = async () => {
+    chrome.kill();
+    await Promise.race([exited, sleep(3000)]);
+    rmSync(profile, { recursive: true, force: true });
+  };
+  const watchdog = setTimeout(async () => { console.error('Timed out.'); await close(); process.exit(3); }, timeout);
   let tabs;
   for (let i = 0; i < 60 && !tabs; i++) {
     try { tabs = await (await fetch(`http://127.0.0.1:${port}/json`)).json(); } catch { await sleep(250); }
@@ -43,5 +50,5 @@ export async function openPage({ port = 9400, timeout = 600000 } = {}) {
   await send('Page.enable');
   await send('Page.navigate', { url: pathToFileURL(join(root, 'index.html')).href });
   await until('!!window.viewer && !!viewer.live', 30000);
-  return { ev, send, until, errors, close: () => { clearTimeout(watchdog); ws.close(); close(); } };
+  return { ev, send, until, errors, close: () => { clearTimeout(watchdog); ws.close(); return close(); } };
 }

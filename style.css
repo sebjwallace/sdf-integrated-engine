@@ -159,13 +159,15 @@ select {
 }
 /* The selection shows as the row highlight, not as a pressed button. */
 #objects .object-name[aria-pressed="true"] { color: inherit; background: transparent; }
-#objects .object-eye {
+#objects .object-eye,
+#objects .object-frame {
   display: grid;
   place-items: center;
-  padding: 2px 8px;
+  padding: 2px 6px;
   color: var(--muted);
 }
-#objects .object-eye:hover { color: var(--text); }
+#objects .object-eye:hover,
+#objects .object-frame:hover { color: var(--text); }
 
 /* On narrow screens the outliner starts below the toolbar's first rows. */
 @media (max-width: 760px) {

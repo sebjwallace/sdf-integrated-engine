@@ -77,6 +77,8 @@ uniform vec3 uCenter,uExtent;  // bounding box: everything lives inside this
 uniform vec3 uStage;  // floor fade: centre x, centre z, radius
 uniform vec4 uCut;    // cutaway plane: normal, offset. Space beyond it is removed.
 uniform float uHQ,uPick,uMinEps,uHideBodies;
+uniform vec3 uProbeLo,uProbeDims;  // probe grid, see Viewer.frameObject()
+uniform float uProbeVoxel;
 out vec4 fragColor;
 ${SDF_LIBRARY}
 // No body is closer than this to a point inside the stage. Refreshed every frame.
@@ -304,6 +306,16 @@ vec3 shadeHit(vec3 ro,vec3 rd,float t,out float id){
 vec3 aces(vec3 x){return clamp(x*(2.51*x+.03)/(x*(2.43*x+.59)+.14),0.,1.);}
 
 void main(){
+  // Probing: each pixel is a voxel of a 3D grid, its z layers stacked in rows.
+  // Returns the distance there and the nearest object (index + 1).
+  if(uPick>1.5){
+    vec2 f=floor(gl_FragCoord.xy);
+    float z=floor(f.y/uProbeDims.y);
+    f.y-=z*uProbeDims.y;
+    Hit h=mapFull(uProbeLo+(vec3(f,z)+.5)*uProbeVoxel);
+    fragColor=vec4(h.d,h.id+1.,0,0);
+    return;
+  }
   vec2 ndc=(2.*(gl_FragCoord.xy+uJitter)-uRes)/uRes.y;
   vec3 rd=normalize(uCam*vec3(ndc,FOCAL));
   float tFloor=rd.y<0.?-uEye.y/rd.y:-1.;
@@ -799,6 +811,57 @@ class Viewer {
     this.onChange();
   }
 
+  // Points the camera at an object, from the current direction, close enough
+  // to fill the view. Where the object is comes from the GPU: one pass samples
+  // a coarse grid over the scene and reports the nearest object at each point,
+  // so this works for mirrored, posed and simulated objects alike.
+  frameObject(id) {
+    if (!this.pickFbo || id < 0 || id >= this.objects.length) return false;
+    const gl = this.gl;
+    const { center, extent } = this.rayBox;
+    const voxel = (Math.max(...extent) * 2) / 64;
+    const dims = extent.map((e) => Math.max(1, Math.ceil((e * 2) / voxel)));
+    const lo = center.map((c, i) => c - (dims[i] * voxel) / 2);
+    const [w, h] = [dims[0], dims[1] * dims[2]];
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA16F, w, h);
+    const fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    gl.disable(gl.BLEND);
+    gl.disable(gl.SCISSOR_TEST);
+    gl.viewport(0, 0, w, h);
+    // A hidden object can still be framed.
+    const wasHidden = this.hidden[id];
+    this.hidden[id] = 0;
+    this.draw(false, w, h, [0, 0], false, { lo, dims, voxel });
+    this.hidden[id] = wasHidden;
+    const out = new Float32Array(w * h * 4);
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.FLOAT, out);
+    gl.deleteFramebuffer(fbo);
+    gl.deleteTexture(tex);
+    this.restart(false);
+
+    // Voxels on or inside the object's surface give its bounding box.
+    const min = [Infinity, Infinity, Infinity];
+    const max = [-Infinity, -Infinity, -Infinity];
+    for (let k = 0; k < w * h; k++) {
+      if (out[k * 4] > voxel * 0.9 || Math.abs(out[k * 4 + 1] - (id + 1)) > 0.5) continue;
+      const row = Math.floor(k / w);
+      const cell = [k % w, row % dims[1], Math.floor(row / dims[1])];
+      cell.forEach((c, i) => { min[i] = Math.min(min[i], c); max[i] = Math.max(max[i], c + 1); });
+    }
+    if (min[0] === Infinity) return false;
+    const a = min.map((c, i) => lo[i] + c * voxel);
+    const b = max.map((c, i) => lo[i] + c * voxel);
+    const radius = Math.hypot(...b.map((v, i) => v - a[i])) / 2;
+    this.goal.target = a.map((v, i) => (v + b[i]) / 2);
+    // A sphere of this radius fills the height of the view, with a margin.
+    this.goal.dist = radius * Math.hypot(1, 3.2) * 1.1;
+    return true;
+  }
+
   // The object under the pointer, or -1.
   objectAt(x, y) {
     const hit = this.pick(x, y, true);
@@ -973,6 +1036,8 @@ class Viewer {
       if (typing(e)) return;
       if ((e.key === 'Delete' || e.key === 'Backspace') && this.hover) this.removeEdit(this.hover);
       if (e.key === 'Escape') { this.setTool('orbit'); this.select(-1); }
+      // F frames the selected object, as in Unreal.
+      if (e.code === 'KeyF' && !e.metaKey && !e.ctrlKey && !e.altKey && this.selected >= 0) this.frameObject(this.selected);
       // H hides the selected object, as in Blender.
       if (e.code === 'KeyH' && !e.metaKey && !e.ctrlKey && !e.altKey && this.selected >= 0) this.setHidden(this.selected, true);
       if (FLY_KEYS[e.code] && !e.metaKey && !e.ctrlKey && !e.altKey) {
@@ -1027,7 +1092,8 @@ class Viewer {
   }
 
   zoom(factor) {
-    this.goal.dist = Math.min(this.bound.radius * 8, Math.max(this.bound.radius * 0.25, this.goal.dist * factor));
+    // The near limit is small so that zooming after framing a small part does not jump.
+    this.goal.dist = Math.min(this.bound.radius * 8, Math.max(this.bound.radius * 0.03, this.goal.dist * factor));
   }
 
   pan(dx, dy) {
@@ -1068,16 +1134,21 @@ class Viewer {
     return true;
   }
 
-  draw(hq, width, height, jitter, pick = false) {
+  draw(hq, width, height, jitter, pick = false, probe = null) {
     const gl = this.gl;
     const { eye, forward, right, up } = this.basis(this.cam);
     const program = this.active;
     const u = program.uniforms;
     gl.useProgram(program.prog);
+    if (probe) {
+      gl.uniform3fv(u.uProbeLo, probe.lo);
+      gl.uniform3fv(u.uProbeDims, probe.dims);
+      gl.uniform1f(u.uProbeVoxel, probe.voxel);
+    }
     const voxel = this.usingField ? this.field.voxel : 0;
     gl.uniform1f(u.uMinEps, Math.max(0.0006, voxel));
     gl.uniform1f(u.uCutDepth, Math.max(0.012, voxel * 1.5));
-    gl.uniform1f(u.uPick, pick ? 1 : 0);
+    gl.uniform1f(u.uPick, probe ? 2 : pick ? 1 : 0);
     gl.uniform1f(u.uHideBodies, pick && !this.pickBodies ? 1 : 0);
     gl.uniform4fv(u.uCut, this.cutPlane);
     // Picking looks at the unedited model, so a hole can glide along the surface

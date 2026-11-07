@@ -62,5 +62,5 @@ const open = results.filter((r) => !r.pass && r.open);
 console.log(`\n${results.length - failed.length - open.length} of ${results.length} passed, ${failed.length} failed, ${open.length} known and open. Frames while dragging: median ${frames.median} ms, 95th percentile ${frames.p95} ms.`);
 console.log(`Measurements: ${JSON.stringify({ throws: measurements.throws, lift: measurements.lift, pile: measurements.pile })}`);
 if (errors.length) console.log(errors.join('\n'));
-page.close();
+await page.close();
 process.exit(failed.length ? 1 : 0);

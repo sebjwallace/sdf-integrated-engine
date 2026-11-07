@@ -77,6 +77,7 @@ uniform vec3 uCenter,uExtent;  // bounding box: everything lives inside this
 uniform vec3 uStage;  // floor fade: centre x, centre z, radius
 uniform vec4 uCut;    // cutaway plane: normal, offset. Space beyond it is removed.
 uniform float uHQ,uPick,uMinEps,uHideBodies;
+uniform float uGI,uGIStrength,uSeed;  // global illumination: on, strength, sample number
 uniform vec3 uProbeLo,uProbeDims;  // probe grid, see Viewer.frameObject()
 uniform float uProbeVoxel;
 out vec4 fragColor;
@@ -192,7 +193,15 @@ vec3 studio(vec3 rd,float blur){
   return c;
 }
 
-vec3 lightSurface(vec3 p,vec3 n,vec3 rd,Hit m,float shadow,float ao){
+// The light from the sky above and the ground below. With global illumination
+// off, this is all the surface gets besides the key light, dimmed by ao.
+const vec3 SKY=vec3(.34,.38,.46),GROUND=vec3(.13,.13,.14);
+vec3 fakeAmbient(vec3 n,float ao){
+  return (SKY*(.5+.5*n.y)+GROUND*(.5-.5*n.y))*ao;
+}
+
+// amb is the light arriving from everywhere except the key light.
+vec3 lightSurface(vec3 p,vec3 n,vec3 rd,Hit m,float shadow,vec3 amb){
   float ndl=max(dot(n,KEY),0.);
   vec3 h=normalize(KEY-rd);
   float ndv=max(dot(n,-rd),0.);
@@ -200,9 +209,7 @@ vec3 lightSurface(vec3 p,vec3 n,vec3 rd,Hit m,float shadow,float ao){
   vec3 F=f0+(1.-f0)*pow(1.-ndv,5.);
   float a=max(m.rough*m.rough,.002);
   float D=a*a/pow(max(dot(n,h),0.)*max(dot(n,h),0.)*(a*a-1.)+1.,2.)/3.1416;
-  vec3 diffuse=m.col*(1.-m.metal)*(vec3(1.,.97,.92)*1.7*ndl*shadow
-    +vec3(.34,.38,.46)*(.5+.5*n.y)*ao
-    +vec3(.13,.13,.14)*(.5-.5*n.y)*ao);
+  vec3 diffuse=m.col*(1.-m.metal)*(vec3(1.,.97,.92)*1.7*ndl*shadow+amb);
   vec3 spec=F*min(D,40.)*.2*ndl*shadow;
   return diffuse+spec+m.col*m.glow;
 }
@@ -214,9 +221,48 @@ vec3 reflected(vec3 ro,vec3 rd,float blur){
   vec3 p=ro+rd*t;
   Hit m=mapFull(p);
   vec3 n=normalAt(p,max(.002,uMinEps));
-  vec3 c=lightSurface(p,n,rd,m,1.,.75);
+  vec3 c=lightSurface(p,n,rd,m,1.,fakeAmbient(n,.75));
   vec3 F=mix(vec3(.05),m.col,m.metal);
   return c+F*studio(reflect(rd,n),max(m.rough,.3));
+}
+
+// ---- global illumination: one diffuse bounce, path traced -------------------
+// Each still sample follows one random ray from every surface point. Averaged
+// over the samples, they replace fakeAmbient with the light the scene really
+// bounces: shade in corners and the colour of nearby objects.
+uint giSeed;
+uint pcg(uint v){
+  uint s=v*747796405u+2891336453u;
+  uint w=((s>>((s>>28u)+4u))^s)*277803737u;
+  return (w>>22u)^w;
+}
+float rand(){giSeed=pcg(giSeed);return float(giSeed)/4294967296.;}
+
+// A direction around n, more often near n than at the horizon (cosine-weighted),
+// so the average of the light it finds is the irradiance with no extra weights.
+vec3 cosineDir(vec3 n){
+  float u=rand(),a=6.2831853*rand(),r=sqrt(u);
+  vec3 t=normalize(cross(n,abs(n.y)<.9?vec3(0,1,0):vec3(1,0,0))),b=cross(n,t);
+  return normalize(t*r*cos(a)+b*r*sin(a)+n*sqrt(1.-u));
+}
+
+// The light arriving at p from one random direction. The surface it reaches is
+// lit by the key light and the fake ambient, which stands in for later bounces.
+// The sky and ground are the same as fakeAmbient's, so turning this on changes
+// where light goes, not how bright the scene is.
+vec3 indirect(vec3 p,vec3 n){
+  vec3 d=cosineDir(n),q=p+n*.004;
+  float tF=d.y<0.?-q.y/d.y:-1.;
+  float t=march(q,d,48);
+  if(t>0.&&(tF<0.||t<tF)){
+    vec3 h=q+d*t;
+    Hit m=mapFull(h);
+    vec3 hn=normalAt(h,max(.002,uMinEps));
+    float sh=dot(hn,KEY)>0.?softShadow(h+hn*.003,KEY,14.,12):0.;
+    return lightSurface(h,hn,d,m,sh,fakeAmbient(hn,.6));
+  }
+  if(tF>0.)return GROUND*mix(.35,1.,softShadow(q+d*tF+vec3(0,.002,0),KEY,9.,12));
+  return d.y>0.?SKY:GROUND;
 }
 
 vec3 shadeObject(vec3 ro,vec3 rd,float t,out float id){
@@ -227,7 +273,8 @@ vec3 shadeObject(vec3 ro,vec3 rd,float t,out float id){
   vec3 q=p+n*.003;
   float ao=occlusion(p,n);
   float sh=max(dot(n,KEY),0.)>0.?softShadow(q,KEY,14.,uHQ>.5?40:12):0.;
-  vec3 c=lightSurface(p,n,rd,m,sh,ao);
+  vec3 amb=uGI>.5?mix(fakeAmbient(n,ao),indirect(p,n),uGIStrength):fakeAmbient(n,ao);
+  vec3 c=lightSurface(p,n,rd,m,sh,max(amb,0.));
 
   vec3 r=reflect(rd,n);
   float ndv=max(dot(n,-rd),0.);
@@ -249,7 +296,11 @@ vec3 shadeFloor(vec3 ro,vec3 rd,float t){
     ao=mix(.08,1.,smoothstep(0.,.42,h));
     ao=min(ao,occlusion(p,n));
   }
-  vec3 c=FLOOR*(.28+.72*sh)*ao*1.25;
+  // The floor's ambient is .28 of its full brightness under an open sky.
+  // Scaled so that open sky gives the same, and nearby colours tint it.
+  vec3 amb=vec3(.28*ao);
+  if(uGI>.5)amb=mix(amb,.28*indirect(p,n)/SKY,uGIStrength);
+  vec3 c=FLOOR*1.25*(max(amb,0.)+.72*sh*ao);
 
   float ndv=max(-rd.y,0.);
   float F=.03+.45*pow(1.-ndv,4.);
@@ -260,7 +311,7 @@ vec3 shadeFloor(vec3 ro,vec3 rd,float t){
       vec3 rp=p+r*rt;
       Hit m=mapFull(rp);
       vec3 rn=normalAt(rp,max(.003,uMinEps));
-      c+=F*lightSurface(rp,rn,r,m,1.,.7)*exp(-rt*1.1);
+      c+=F*lightSurface(rp,rn,r,m,1.,fakeAmbient(rn,.7))*exp(-rt*1.1);
     }
   }
   return mix(c,backdrop(rd),smoothstep(R*1.6,R*5.,dist));
@@ -316,6 +367,7 @@ void main(){
     fragColor=vec4(h.d,h.id+1.,0,0);
     return;
   }
+  giSeed=pcg(uint(gl_FragCoord.x)+pcg(uint(gl_FragCoord.y)+pcg(uint(uSeed))));
   vec2 ndc=(2.*(gl_FragCoord.xy+uJitter)-uRes)/uRes.y;
   vec3 rd=normalize(uCam*vec3(ndc,FOCAL));
   float tFloor=rd.y<0.?-uEye.y/rd.y:-1.;
@@ -394,7 +446,9 @@ class Viewer {
     this.strips = 1;
     this.sample = 0;
     this.strip = 0;
-    this.maxSamples = 16;
+    // Global illumination: light bouncing off one surface onto another. Only
+    // drawn while still; it is noisy per sample, so it averages more of them.
+    this.gi = { enabled: false, strength: 1, samples: 64 };
 
     // The gizmo is drawn on a 2D canvas laid over this one.
     this.overlay = document.createElement('canvas');
@@ -1200,6 +1254,15 @@ class Viewer {
     return hit ? hit[1] - 1 : -1;
   }
 
+  // Samples averaged once the camera stops.
+  get maxSamples() { return this.gi.enabled ? this.gi.samples : 16; }
+
+  // { enabled, strength (0 to 2, 1 is physical), samples }. Any may be omitted.
+  setGI(change) {
+    Object.assign(this.gi, change);
+    this.restart(false);
+  }
+
   setQuality(scale) {
     this.quality = scale;
     this.restart(false);
@@ -1211,7 +1274,15 @@ class Viewer {
     return this.moving ? this.previewScale : 1;
   }
 
+  // The status line, with how far global illumination has refined.
   describe() {
+    const base = this.describeScene();
+    if (!this.gi.enabled) return base;
+    if (this.moving) return `${base} · GI when still`;
+    return `${base} · GI ${Math.min(this.sample, this.maxSamples)}/${this.maxSamples} samples`;
+  }
+
+  describeScene() {
     const f = this.field;
     if (this.sim) {
       const { bodies, stats } = this.sim;
@@ -1545,6 +1616,9 @@ class Viewer {
     }
     this.setObjectUniforms(u);
     gl.uniform1f(u.uHQ, hq ? 1 : 0);
+    gl.uniform1f(u.uGI, this.gi.enabled && hq && !this.moving && !pick && !probe ? 1 : 0);
+    gl.uniform1f(u.uGIStrength, this.gi.strength);
+    gl.uniform1f(u.uSeed, this.sample);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
   }
 

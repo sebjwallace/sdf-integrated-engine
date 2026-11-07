@@ -90,6 +90,14 @@ output {
 
 #quality-value { min-width: 4ch; }
 
+#gi-strength {
+  flex: 0 1 110px;
+  min-width: 90px;
+}
+
+#gi-strength-value { min-width: 4ch; }
+input[type="range"]:disabled { opacity: 0.4; }
+
 .group-label { color: var(--muted); }
 #transform-note { color: var(--muted); font-size: 12px; }
 

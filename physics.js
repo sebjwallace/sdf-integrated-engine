@@ -10,6 +10,8 @@
 //   penetration depth  the (negative) distance itself
 //   tunnelling         a point that moved further than the distances at both
 //                      ends of its path allow must have crossed a surface
+//   thin or sharp      walking downhill on max(dA, dB) finds the deepest point
+//   overlaps           shared by two solids, wherever the samples happen to be
 //
 // The world is treated like any other body, except that it never moves.
 //
@@ -28,6 +30,7 @@ const PHYSICS = {
   rollingResistance: 0.012, // a torque, as a length: how far the load sits off-centre
   slop: 0.002,         // overlap allowed at rest, so resting contacts stay in touch
   maxPushSpeed: 6,     // deep overlaps separate at this speed, not explosively
+  softPushSpeed: 4,    // the same limit, for contacts from the overlap search
   maxSpeed: 40,
   sleepSpeed: 0.12,
   sleepAfter: 0.6,
@@ -121,55 +124,62 @@ const analyseShape = (shape, sampleCount = 32) => {
   const d = shape.d;
   const random = makeRandom(12345);
 
-  // How far does it reach? March inwards from far away in many directions.
-  let reach = 0;
-  const far = 16;
-  for (let i = 0; i < 128; i++) {
-    const y = 1 - (2 * (i + 0.5)) / 128;
-    const r = Math.sqrt(1 - y * y);
-    const a = i * 2.39996323;
-    const dir = [Math.cos(a) * r, y, Math.sin(a) * r];
-    for (let t = far, n = 0; t > 0 && n < 96; n++) {
-      const dist = d(dir[0] * t, dir[1] * t, dir[2] * t);
-      if (dist < 0.0005) { reach = Math.max(reach, t); break; }
-      t -= dist;
-    }
-  }
-  const box = reach * 1.05;
-
-  // Surface candidates: pull random points onto d = 0.
-  const candidates = [];
-  for (let n = 0; n < 1400; n++) {
-    let x = (random() * 2 - 1) * box;
-    let y = (random() * 2 - 1) * box;
-    let z = (random() * 2 - 1) * box;
+  // Pulling a point onto d = 0 works from anywhere, which also finds how far a
+  // shape reaches. Marching in along fixed directions can miss thin shapes.
+  const project = (px, py, pz) => {
+    let x = px;
+    let y = py;
+    let z = pz;
     let dist = 1;
-    for (let it = 0; it < 12 && Math.abs(dist) > 2e-4; it++) {
+    for (let it = 0; it < 16 && Math.abs(dist) > 2e-4; it++) {
       dist = d(x, y, z);
       const g = gradientOf(d, x, y, z);
       x -= g[0] * dist;
       y -= g[1] * dist;
       z -= g[2] * dist;
     }
-    if (Math.abs(d(x, y, z)) < 1e-3) candidates.push([x, y, z]);
+    return Math.abs(d(x, y, z)) < 1e-3 ? [x, y, z] : null;
+  };
+  const candidates = [];
+  const far = 32;
+  for (let n = 0; n < 500; n++) {
+    const p = project((random() * 2 - 1) * far, (random() * 2 - 1) * far, (random() * 2 - 1) * far);
+    if (p) candidates.push(p);
+  }
+  const bounds = (list) => [0, 1, 2].map((i) => [Math.min(...list.map((p) => p[i])), Math.max(...list.map((p) => p[i]))]);
+
+  // Then again from inside those bounds, which reaches concave parts and interiors.
+  for (let round = 0; round < 2; round++) {
+    const b = bounds(candidates);
+    for (let n = 0; n < 900; n++) {
+      const p = project(
+        b[0][0] + random() * (b[0][1] - b[0][0]),
+        b[1][0] + random() * (b[1][1] - b[1][0]),
+        b[2][0] + random() * (b[2][1] - b[2][0]),
+      );
+      if (p) candidates.push(p);
+    }
   }
 
-  // Mass properties: add up small cells over the shape's tight bounds. A cell cut
-  // by the surface counts in part, which the distance at its centre tells us.
-  const lo = [0, 1, 2].map((i) => Math.min(...candidates.map((p) => p[i])));
-  const hi = [0, 1, 2].map((i) => Math.max(...candidates.map((p) => p[i])));
-  const cell = Math.max(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]) / 48;
-  const counts = [0, 1, 2].map((i) => Math.ceil((hi[i] - lo[i]) / cell) + 4);
+  // Mass properties: add up small cells over the shape's tight bounds, with the
+  // same number along each axis so a thin bar is measured as well as a cube. A cell
+  // cut by the surface counts in part, which the distance at its centre tells us.
+  const [bx, by, bz] = bounds(candidates);
+  const cells = 40;
+  const cx = (bx[1] - bx[0]) / cells;
+  const cy = (by[1] - by[0]) / cells;
+  const cz = (bz[1] - bz[0]) / cells;
+  const blur = Math.min(cx, cy, cz);
   const com = [0, 0, 0];
   const inside = [];
   let volume = 0;
-  for (let i = 0; i < counts[0]; i++) {
-    for (let j = 0; j < counts[1]; j++) {
-      for (let k = 0; k < counts[2]; k++) {
-        const x = lo[0] + (i - 1.5) * cell;
-        const y = lo[1] + (j - 1.5) * cell;
-        const z = lo[2] + (k - 1.5) * cell;
-        const fill = Math.max(0, Math.min(1, 0.5 - d(x, y, z) / cell));
+  for (let i = -1; i <= cells; i++) {
+    for (let j = -1; j <= cells; j++) {
+      for (let k = -1; k <= cells; k++) {
+        const x = bx[0] + (i + 0.5) * cx;
+        const y = by[0] + (j + 0.5) * cy;
+        const z = bz[0] + (k + 0.5) * cz;
+        const fill = Math.max(0, Math.min(1, 0.5 - d(x, y, z) / blur));
         if (fill <= 0) continue;
         inside.push([x, y, z, fill]);
         volume += fill;
@@ -182,16 +192,19 @@ const analyseShape = (shape, sampleCount = 32) => {
   com[0] /= volume;
   com[1] /= volume;
   com[2] /= volume;
-  const unit = cell * cell * cell;
+  const unit = cx * cy * cz;
   const inertia = [0, 0, 0, 0, 0, 0, 0, 0, 0];
-  const selfTerm = (cell * cell) / 6; // each cell's own inertia, about its centre
+  // Each cell's own inertia, about its centre.
+  const selfX = (cy * cy + cz * cz) / 12;
+  const selfY = (cx * cx + cz * cz) / 12;
+  const selfZ = (cx * cx + cy * cy) / 12;
   for (const [px, py, pz, fill] of inside) {
     const x = px - com[0];
     const y = py - com[1];
     const z = pz - com[2];
-    inertia[0] += (y * y + z * z + selfTerm) * fill;
-    inertia[4] += (x * x + z * z + selfTerm) * fill;
-    inertia[8] += (x * x + y * y + selfTerm) * fill;
+    inertia[0] += (y * y + z * z + selfX) * fill;
+    inertia[4] += (x * x + z * z + selfY) * fill;
+    inertia[8] += (x * x + y * y + selfZ) * fill;
     inertia[1] -= x * y * fill;
     inertia[2] -= x * z * fill;
     inertia[5] -= y * z * fill;
@@ -206,7 +219,7 @@ const analyseShape = (shape, sampleCount = 32) => {
   const nearest = candidates.map((p) => Math.hypot(p[0] - com[0], p[1] - com[1], p[2] - com[2]) * -1);
   let next = nearest.indexOf(Math.min(...nearest));
   const chosen = [];
-  let spacing = reach;
+  let spacing = Math.hypot(bx[1] - bx[0], by[1] - by[0], bz[1] - bz[0]);
   nearest.fill(Infinity);
   for (let n = 0; n < sampleCount && candidates.length; n++) {
     const pick = candidates[next];
@@ -230,6 +243,59 @@ const analyseShape = (shape, sampleCount = 32) => {
   };
   analysisCache.set(shape, result);
   return result;
+};
+
+// The deepest point inside both solids, or null if they do not overlap. First
+// project onto whichever solid the point is outside of, until it is inside both.
+// Then walk downhill on max(dA, dB). Needs nothing but the two distance functions.
+const deepestOverlap = (fa, fb, sx, sy, sz) => {
+  let x = sx;
+  let y = sy;
+  let z = sz;
+  let a = fa(x, y, z);
+  let b = fb(x, y, z);
+  for (let i = 0; i < 10 && (a >= 0 || b >= 0); i++) {
+    const outside = a >= b ? fa : fb;
+    const d = Math.max(a, b);
+    const n = gradientOf(outside, x, y, z);
+    x -= n[0] * (d + 1e-4);
+    y -= n[1] * (d + 1e-4);
+    z -= n[2] * (d + 1e-4);
+    a = fa(x, y, z);
+    b = fb(x, y, z);
+  }
+  if (a >= 0 || b >= 0) return null;
+
+  let f = Math.max(a, b);
+  let step = Math.max(-f, 0.004);
+  for (let i = 0; i < 12 && step > 2e-4; i++) {
+    const na = gradientOf(fa, x, y, z);
+    const nb = gradientOf(fb, x, y, z);
+    const close = step * 0.5;
+    const dx = a > b + close ? na[0] : b > a + close ? nb[0] : na[0] + nb[0];
+    const dy = a > b + close ? na[1] : b > a + close ? nb[1] : na[1] + nb[1];
+    const dz = a > b + close ? na[2] : b > a + close ? nb[2] : na[2] + nb[2];
+    const len = Math.hypot(dx, dy, dz);
+    if (len < 0.05) break; // the two surfaces face each other, so this is the bottom
+    const tx = x - (dx / len) * step;
+    const ty = y - (dy / len) * step;
+    const tz = z - (dz / len) * step;
+    const ta = fa(tx, ty, tz);
+    const tb = fb(tx, ty, tz);
+    const trial = Math.max(ta, tb);
+    if (trial < f) {
+      x = tx;
+      y = ty;
+      z = tz;
+      a = ta;
+      b = tb;
+      f = trial;
+      step *= 1.3;
+    } else {
+      step *= 0.5;
+    }
+  }
+  return { x, y, z, deepest: -f };
 };
 
 class RigidBody {
@@ -323,6 +389,9 @@ class RigidBody {
     return [this.dx[0] + t[0], this.dx[1] + t[1], this.dx[2] + t[2]];
   }
 
+  // The fastest any point on the body can be moving.
+  get pointSpeed() { return Math.hypot(...this.v) + Math.hypot(...this.w) * this.info.radius; }
+
   velocityAt(r) {
     const t = cross3(this.w, r);
     return [this.v[0] + t[0], this.v[1] + t[1], this.v[2] + t[2]];
@@ -356,6 +425,7 @@ class PhysicsWorld {
     this.edits = [];
     this.grab = null;
     this.manifolds = [];
+    this.overlapMemory = new Map();
     this.accumulator = 0;
     this.stats = { stepMs: 0, contacts: 0, queries: 0, sweeps: 0 };
     // What the world's surface is right now, including live edits.
@@ -383,6 +453,7 @@ class PhysicsWorld {
 
   add(shape, options) {
     const body = new RigidBody(shape, options);
+    body.id = this.bodies.length;
     this.bodies.push(body);
     return body;
   }
@@ -391,6 +462,7 @@ class PhysicsWorld {
     for (const b of this.bodies) b.reset();
     this.grab = null;
     this.manifolds = [];
+    this.overlapMemory.clear();
     this.accumulator = 0;
   }
 
@@ -451,7 +523,7 @@ class PhysicsWorld {
     const h = dt / this.substeps;
     this.stats.contacts = 0;
     for (let i = 0; i < this.substeps; i++) {
-      const fast = this.bodies.some((b) => !b.sleeping && b.v[0] * b.v[0] + b.v[1] * b.v[1] + b.v[2] * b.v[2] > PHYSICS.fastSpeed ** 2);
+      const fast = this.bodies.some((b) => !b.sleeping && b.pointSpeed > PHYSICS.fastSpeed);
       this.substep(h, fast || i % PHYSICS.searchEvery === 0);
     }
     this.updateSleep(dt);
@@ -498,7 +570,7 @@ class PhysicsWorld {
         for (const c of m.contacts) this.solveNormal(c, h, share);
       }
     }
-    for (const m of contacts) this.solvePatchFriction(m);
+    for (const m of contacts) this.solvePatchFriction(m, h);
     for (const m of contacts) for (const c of m.contacts) this.solveNormal(c, h, 1);
     for (const b of bodies) {
       if (b.sleeping) continue;
@@ -528,8 +600,9 @@ class PhysicsWorld {
     for (const b of bodies) {
       if (b.sleeping) continue;
       // The world's distance at the centre tells us if the whole body is clear.
-      if (this.worldDist(b.x[0], b.x[1], b.x[2]) < b.info.radius + PHYSICS.margin + Math.hypot(...b.v) * horizon) {
-        this.collide(b, null, this.worldDist, contacts, horizon);
+      if (this.worldDist(b.x[0], b.x[1], b.x[2]) < b.info.radius + PHYSICS.margin + b.pointSpeed * horizon) {
+        const seeds = this.collide(b, null, this.worldDist, contacts, horizon);
+        this.collideOverlap(b, null, this.worldDist, seeds, contacts);
       }
     }
     for (let i = 0; i < bodies.length; i++) {
@@ -543,8 +616,11 @@ class PhysicsWorld {
         const dz = a.x[2] - b.x[2];
         if (dx * dx + dy * dy + dz * dz > reach * reach) continue;
         // Each body's samples are tested against the other's distance function.
-        this.collide(a, b, b.dist, contacts, horizon);
-        this.collide(b, a, a.dist, contacts, horizon);
+        const seeds = [
+          ...this.collide(a, b, b.dist, contacts, horizon),
+          ...this.collide(b, a, a.dist, contacts, horizon),
+        ];
+        this.collideOverlap(a, b, b.dist, seeds, contacts);
       }
     }
     return contacts;
@@ -556,6 +632,14 @@ class PhysicsWorld {
     const live = [];
     for (const m of manifolds) {
       const { A, B, field } = m;
+      if (m.overlap) {
+        // The deepest point moves as the bodies do, so follow it from where it was.
+        const r = mulMat3(A.R, m.contacts[0].local);
+        const hit = deepestOverlap(A.dist, field, A.x[0] + r[0], A.x[1] + r[1], A.x[2] + r[2]);
+        const contact = hit && this.overlapContact(A, B, field, hit);
+        if (contact) live.push({ A, B, field, overlap: true, contacts: [contact] });
+        continue;
+      }
       const contacts = [];
       for (const c of m.contacts) {
         const rA = mulMat3(A.R, c.local);
@@ -584,13 +668,26 @@ class PhysicsWorld {
     const { points, spacing } = A.info;
     const found = [];
     const R = A.R;
-    const moving = !B && !!A.xSearch && Math.hypot(...A.v) * h > 0.01;
+    const moving = !B && !!A.xSearch && A.pointSpeed * h > 0.01;
+    let low1 = null;
+    let low2 = null;
+    let lowD1 = Infinity;
+    let lowD2 = Infinity;
     for (const p of points) {
       const r = mulMat3(R, p);
       let x = A.x[0] + r[0];
       let y = A.x[1] + r[1];
       let z = A.x[2] + r[2];
       let d = field(x, y, z);
+      if (d < lowD1) {
+        low2 = low1;
+        lowD2 = lowD1;
+        low1 = [x, y, z];
+        lowD1 = d;
+      } else if (d < lowD2) {
+        low2 = [x, y, z];
+        lowD2 = d;
+      }
 
       if (moving && d > 0) {
         // A point that travelled further than the distances at both ends of its
@@ -660,7 +757,26 @@ class PhysicsWorld {
     for (const f of found) {
       if (!kept.some((k) => Math.hypot(k.x - f.x, k.y - f.y, k.z - f.z) < merge)) kept.push(f);
     }
-    if (!kept.length) return;
+    const seeds = low2 ? [low1, low2] : low1 ? [low1] : [];
+    if (!kept.length) return seeds;
+
+    // Four well-spread points hold any patch. More only rock against each other,
+    // which reads as extra load and makes friction too strong.
+    while (kept.length > 4) {
+      let closest = Infinity;
+      let drop = -1;
+      for (let i = 1; i < kept.length; i++) {
+        for (let j = 0; j < kept.length; j++) {
+          if (i === j) continue;
+          const gap = Math.hypot(kept[i].x - kept[j].x, kept[i].y - kept[j].y, kept[i].z - kept[j].z);
+          if (gap < closest) {
+            closest = gap;
+            drop = i;
+          }
+        }
+      }
+      kept.splice(drop, 1);
+    }
     const manifold = { A, B, field, contacts: [] };
     contacts.push(manifold);
     for (const f of kept) {
@@ -674,6 +790,73 @@ class PhysicsWorld {
         prevB: B ? this.previousOffset(B, rB) : null,
       });
     }
+    return seeds;
+  }
+
+  // Samples can miss an overlap between thin bodies entirely. This asks the
+  // distance functions directly, from a few places likely to find it.
+  collideOverlap(A, B, field, seeds, contacts) {
+    const key = B ? `${A.id}:${B.id}` : `${A.id}`;
+    const starts = [...seeds];
+    const known = this.overlapMemory.get(key);
+    if (known) {
+      const r = mulMat3(A.R, known);
+      starts.unshift([A.x[0] + r[0], A.x[1] + r[1], A.x[2] + r[2]]);
+    }
+    starts.push(B
+      ? [(A.x[0] + B.x[0]) / 2, (A.x[1] + B.x[1]) / 2, (A.x[2] + B.x[2]) / 2]
+      : [...A.x]);
+
+    let best = null;
+    for (const s of starts) {
+      const hit = deepestOverlap(A.dist, field, s[0], s[1], s[2]);
+      if (hit && (!best || hit.deepest > best.deepest)) best = hit;
+      if (best) break; // convex pairs agree, and the first answer costs the least
+    }
+    if (!best) {
+      this.overlapMemory.delete(key);
+      return;
+    }
+    const r = [best.x - A.x[0], best.y - A.x[1], best.z - A.x[2]];
+    this.overlapMemory.set(key, mulMat3T(A.R, r));
+
+    const contact = this.overlapContact(A, B, field, best);
+    if (!contact) return;
+    // This contact exists to catch what the samples miss. If they already reach
+    // about as deep, they are holding this pair, and more load would only distort
+    // friction.
+    let sampled = 0;
+    for (const m of contacts) {
+      if (!((m.A === A && m.B === B) || (m.A === B && m.B === A))) continue;
+      for (const c of m.contacts) sampled = Math.max(sampled, c.depth);
+    }
+    if (contact.depth <= sampled * 1.25 + PHYSICS.slop) return;
+    contacts.push({ A, B, field, overlap: true, contacts: [contact] });
+  }
+
+  overlapContact(A, B, field, hit) {
+    // Half the overlap is on each side of the deepest point. Too little to matter
+    // at rest, where samples are already holding the body up.
+    if (hit.deepest * 2 < PHYSICS.slop * 1.5) return null;
+    // Sharp edges have a gradient that flips between faces, so measure across a
+    // width that averages over the ridge.
+    const e = Math.max(hit.deepest, 0.003);
+    const difference = (x, y, z) => field(x, y, z) - A.dist(x, y, z);
+    const n = gradientOf(difference, hit.x, hit.y, hit.z, e);
+    // Faces meeting head-on separate by twice the deepest distance. Faces at an
+    // angle to the push separate more slowly, so they need further to go.
+    const na = gradientOf(A.dist, hit.x, hit.y, hit.z);
+    const nb = gradientOf(field, hit.x, hit.y, hit.z);
+    const square = Math.max((Math.abs(dot3(n, na)) + Math.abs(dot3(n, nb))) / 2, 0.5);
+    const depth = (hit.deepest * 2) / square;
+    const rA = [hit.x - A.x[0], hit.y - A.x[1], hit.z - A.x[2]];
+    const rB = B ? [hit.x - B.x[0], hit.y - B.x[1], hit.z - B.x[2]] : null;
+    return {
+      A, B, n, depth, swept: false, soft: true, rA, rB, local: mulMat3T(A.R, rA), lambda: 0,
+      vnBefore: dot3(this.relativeVelocity(A, B, rA, rB), n),
+      prevA: this.previousOffset(A, rA),
+      prevB: B ? this.previousOffset(B, rB) : null,
+    };
   }
 
   // March along a path using distances; returns the first time it meets a surface.
@@ -729,7 +912,17 @@ class PhysicsWorld {
       moved[2] -= mb[2];
     }
     // Deep overlaps separate gradually. Swept hits must stop now.
-    const allowed = c.swept ? c.depth : Math.min(Math.max(c.depth - PHYSICS.slop, 0), PHYSICS.maxPushSpeed * h);
+    let allowed;
+    if (c.swept) {
+      allowed = c.depth;
+    } else if (c.soft) {
+      // A single point on a long body is a lever, so a hard push can fling it.
+      // Stop the approach exactly, then ease out of what is left.
+      const approach = Math.max(-c.vnBefore * h, 0);
+      allowed = Math.min(approach + Math.max(c.depth - PHYSICS.slop - approach, 0) * 0.2, PHYSICS.softPushSpeed * h);
+    } else {
+      allowed = Math.min(Math.max(c.depth - PHYSICS.slop, 0), PHYSICS.maxPushSpeed * h);
+    }
     const remaining = allowed - dot3(moved, n);
     if (remaining <= 0) return;
     const wn = A.resistance(rA, n) + (B ? B.resistance(rB, n) : 0);
@@ -744,7 +937,7 @@ class PhysicsWorld {
   // All contacts between two bodies act as one patch. Friction applied at the
   // patch's load-weighted centre cannot twist a block the way friction at one
   // off-centre point would, and the patch's size gives real torsional friction.
-  summarisePatch(m) {
+  summarisePatch(m, h) {
     const { A, B, contacts } = m;
     let total = 0;
     const rA = [0, 0, 0];
@@ -768,14 +961,30 @@ class PhysicsWorld {
     n[1] /= len;
     n[2] /= len;
     let spread = 0;
-    for (const c of contacts) spread += c.lambda * Math.hypot(c.rA[0] - rA[0], c.rA[1] - rA[1], c.rA[2] - rA[2]);
+    let closing = 0;
+    for (const c of contacts) {
+      spread += c.lambda * Math.hypot(c.rA[0] - rA[0], c.rA[1] - rA[1], c.rA[2] - rA[2]);
+      closing += c.lambda * c.vnBefore;
+    }
     const friction = B ? Math.sqrt(A.friction * B.friction) : A.friction;
-    return { A, B, total, rA, rB, n, spread: Math.max(spread / total, 0.01), friction };
+
+    // Friction depends on the load being carried. Pushes that only ease old overlap
+    // out carry nothing, so the load is what stopping the approach takes, plus
+    // whatever other contacts are pressing these two bodies together with.
+    const linear = A.im + (B ? B.im : 0);
+    let load = total;
+    if (linear > 0) {
+      let carried = (Math.max(-closing / total, 0) * h) / linear;
+      if (A.im > 0) carried += Math.max(total - dot3(A.dx, n) / A.im, 0);
+      if (B && B.im > 0) carried += Math.max(dot3(B.dx, n) / B.im + total, 0);
+      load = Math.min(total, carried);
+    }
+    return { A, B, total: load, rA, rB, n, spread: Math.max(spread / total, 0.01), friction };
   }
 
   // Static friction: undo sideways slip, up to what the normal load allows.
-  solvePatchFriction(m) {
-    const patch = this.summarisePatch(m);
+  solvePatchFriction(m, h) {
+    const patch = this.summarisePatch(m, h);
     if (!patch) return;
     const { A, B, rA, rB, n, total, friction } = patch;
     const prevA = this.previousOffset(A, rA);
@@ -804,7 +1013,7 @@ class PhysicsWorld {
   }
 
   solveVelocity(m, h) {
-    const patch = this.summarisePatch(m);
+    const patch = this.summarisePatch(m, h);
     if (!patch) return;
     const { A, B, rA, rB, n, total, friction, spread } = patch;
 

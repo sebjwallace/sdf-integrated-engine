@@ -347,6 +347,13 @@ SDF.scenes.physics = {
     // These two rings start directly over the peg, to test threading a hole.
     const hoop = ring.paint('#f2f2f2', 0.3);
     bodies.push({ shape: hoop, at: [0.1, 2.7, -0.4], rotate: [6, 0, 4] });
+    // Thin beams, which meet each other with no surface sample near the crossing.
+    const beam = box(0.14, 0.14, 2.6).paint('#d7dbe0', 0.35, 0.6);
+    bodies.push(
+      { shape: beam, at: [-1.6, 5.4, 2], rotate: [0, 20, 0] },
+      { shape: beam, at: [-1.5, 4.8, 2.1], rotate: [0, 100, 0] },
+      { shape: beam, at: [-1.7, 4.2, 1.9], rotate: [0, 60, 0] },
+    );
     return { world, bodies };
   },
 };

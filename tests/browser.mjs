@@ -20,7 +20,12 @@ export async function openPage({ port = 9400, timeout = 600000 } = {}) {
   const close = async () => {
     chrome.kill();
     await Promise.race([exited, sleep(3000)]);
-    rmSync(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+    // Chrome's helper processes can still be writing to the profile for a moment
+    // after the main one exits, so a delete can fail with ENOTEMPTY. Try again.
+    for (let i = 0; i < 10; i++) {
+      try { rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); return; } catch { await sleep(500); }
+    }
+    console.error(`Could not delete the test profile ${profile}`);
   };
   const watchdog = setTimeout(async () => { console.error('Timed out.'); await close(); process.exit(3); }, timeout);
   let tabs;

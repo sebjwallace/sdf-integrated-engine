@@ -67,6 +67,25 @@ vec2 polarFold(vec2 p,float n){
 }
 `;
 
+// One global illumination ray: the light arriving along d from q. The surface it
+// reaches is lit by the key light plus ambient, which the second bounce
+// takes from another ray and the last takes from fakeAmbient. GLSL has no
+// recursion, so each bounce is its own copy of this function.
+const GI_RAY = (name, ambient) => `
+vec3 ${name}(vec3 q,vec3 d){
+  float tF=d.y<0.?-q.y/d.y:-1.;
+  float t=march(q,d,48);
+  if(t>0.&&(tF<0.||t<tF)){
+    vec3 h=q+d*t;
+    Hit m=mapFull(h);
+    vec3 hn=normalAt(h,max(.002,uMinEps));
+    float sh=dot(hn,KEY)>0.?softShadow(h+hn*.003,KEY,14.,12):0.;
+    return lightSurface(h,hn,d,m,sh,${ambient});
+  }
+  if(tF>0.)return GROUND*mix(.35,1.,softShadow(q+d*tF+vec3(0,.002,0),KEY,9.,12));
+  return d.y>0.?SKY:GROUND;
+}`;
+
 const FRAGMENT_SHADER = (sceneCode, baked, editsInTree = false) => `#version 300 es
 precision highp float;
 precision highp sampler3D;
@@ -77,7 +96,7 @@ uniform vec3 uCenter,uExtent;  // bounding box: everything lives inside this
 uniform vec3 uStage;  // floor fade: centre x, centre z, radius
 uniform vec4 uCut;    // cutaway plane: normal, offset. Space beyond it is removed.
 uniform float uHQ,uPick,uMinEps,uHideBodies;
-uniform float uGI,uGIStrength,uSeed;  // global illumination: on, strength, sample number
+uniform float uGI,uGIStrength,uGIBounces,uSeed;  // global illumination: on, strength, bounces, sample number
 uniform vec3 uProbeLo,uProbeDims;  // probe grid, see Viewer.frameObject()
 uniform float uProbeVoxel;
 out vec4 fragColor;
@@ -226,11 +245,12 @@ vec3 reflected(vec3 ro,vec3 rd,float blur){
   return c+F*studio(reflect(rd,n),max(m.rough,.3));
 }
 
-// ---- global illumination: one diffuse bounce, path traced -------------------
+// ---- global illumination: diffuse bounces, path traced -----------------------
 // Each still sample follows one random ray from every surface point. Averaged
 // over the samples, they replace fakeAmbient with the light the scene really
 // bounces: shade in corners and the colour of nearby objects.
 uint giSeed;
+vec2 giOffset;
 uint pcg(uint v){
   uint s=v*747796405u+2891336453u;
   uint w=((s>>((s>>28u)+4u))^s)*277803737u;
@@ -238,31 +258,30 @@ uint pcg(uint v){
 }
 float rand(){giSeed=pcg(giSeed);return float(giSeed)/4294967296.;}
 
+// The first bounce's random numbers for this sample. Consecutive samples step
+// through the R2 sequence, which covers the square evenly, from a random start
+// for each pixel. Its directions spread over the hemisphere instead of
+// clumping, so the image is less noisy after the same number of samples.
+vec2 firstBounce(){return fract(giOffset+uSeed*vec2(.7548776662,.5698402910));}
+
 // A direction around n, more often near n than at the horizon (cosine-weighted),
 // so the average of the light it finds is the irradiance with no extra weights.
-vec3 cosineDir(vec3 n){
-  float u=rand(),a=6.2831853*rand(),r=sqrt(u);
+// u is two numbers in [0, 1).
+vec3 cosineDir(vec3 n,vec2 u2){
+  float u=u2.x,a=6.2831853*u2.y,r=sqrt(u);
   vec3 t=normalize(cross(n,abs(n.y)<.9?vec3(0,1,0):vec3(1,0,0))),b=cross(n,t);
   return normalize(t*r*cos(a)+b*r*sin(a)+n*sqrt(1.-u));
 }
 
-// The light arriving at p from one random direction. The surface it reaches is
-// lit by the key light and the fake ambient, which stands in for later bounces.
 // The sky and ground are the same as fakeAmbient's, so turning this on changes
-// where light goes, not how bright the scene is.
+// where light goes, not how bright the scene is. fakeAmbient stands in for the
+// bounces after the last one.
+${GI_RAY('secondBounce', 'fakeAmbient(hn,.6)')}
+${GI_RAY('bounce', 'uGIBounces>1.5?secondBounce(h+hn*.004,cosineDir(hn,vec2(rand(),rand()))):fakeAmbient(hn,.6)')}
+
+// The light arriving at p from one random direction.
 vec3 indirect(vec3 p,vec3 n){
-  vec3 d=cosineDir(n),q=p+n*.004;
-  float tF=d.y<0.?-q.y/d.y:-1.;
-  float t=march(q,d,48);
-  if(t>0.&&(tF<0.||t<tF)){
-    vec3 h=q+d*t;
-    Hit m=mapFull(h);
-    vec3 hn=normalAt(h,max(.002,uMinEps));
-    float sh=dot(hn,KEY)>0.?softShadow(h+hn*.003,KEY,14.,12):0.;
-    return lightSurface(h,hn,d,m,sh,fakeAmbient(hn,.6));
-  }
-  if(tF>0.)return GROUND*mix(.35,1.,softShadow(q+d*tF+vec3(0,.002,0),KEY,9.,12));
-  return d.y>0.?SKY:GROUND;
+  return bounce(p+n*.004,cosineDir(n,firstBounce()));
 }
 
 vec3 shadeObject(vec3 ro,vec3 rd,float t,out float id){
@@ -367,7 +386,9 @@ void main(){
     fragColor=vec4(h.d,h.id+1.,0,0);
     return;
   }
-  giSeed=pcg(uint(gl_FragCoord.x)+pcg(uint(gl_FragCoord.y)+pcg(uint(uSeed))));
+  giSeed=pcg(uint(gl_FragCoord.x)+pcg(uint(gl_FragCoord.y)));
+  giOffset=vec2(rand(),rand());
+  giSeed=pcg(giSeed+pcg(uint(uSeed)));
   vec2 ndc=(2.*(gl_FragCoord.xy+uJitter)-uRes)/uRes.y;
   vec3 rd=normalize(uCam*vec3(ndc,FOCAL));
   float tFloor=rd.y<0.?-uEye.y/rd.y:-1.;
@@ -418,6 +439,10 @@ class Viewer {
     if (!gl) throw new Error('This browser does not support WebGL2.');
 
     this.floatTarget = !!gl.getExtension('EXT_color_buffer_float');
+    // Still frames average many samples into this target. Half floats keep about
+    // three digits, so past a few dozen samples each new one is rounded away.
+    // Full floats need blending and filtering support, which most GPUs have.
+    this.fullFloat = this.floatTarget && !!gl.getExtension('EXT_float_blend') && !!gl.getExtension('OES_texture_float_linear');
     gl.bindVertexArray(gl.createVertexArray());
     this.present = this.link(PRESENT_SHADER);
     this.fbo = gl.createFramebuffer();
@@ -448,7 +473,7 @@ class Viewer {
     this.strip = 0;
     // Global illumination: light bouncing off one surface onto another. Only
     // drawn while still; it is noisy per sample, so it averages more of them.
-    this.gi = { enabled: false, strength: 1, samples: 64 };
+    this.gi = { enabled: false, strength: 1, samples: 32, bounces: 1 };
 
     // The gizmo is drawn on a 2D canvas laid over this one.
     this.overlay = document.createElement('canvas');
@@ -1257,7 +1282,8 @@ class Viewer {
   // Samples averaged once the camera stops.
   get maxSamples() { return this.gi.enabled ? this.gi.samples : 16; }
 
-  // { enabled, strength (0 to 2, 1 is physical), samples }. Any may be omitted.
+  // { enabled, strength (0 to 2, 1 is physical), samples, bounces (1 or 2) }.
+  // Any may be omitted.
   setGI(change) {
     Object.assign(this.gi, change);
     this.restart(false);
@@ -1322,7 +1348,8 @@ class Viewer {
     this.canvas.height = h;
     const gl = this.gl;
     gl.bindTexture(gl.TEXTURE_2D, this.tex);
-    if (this.floatTarget) gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, w, h, 0, gl.RGBA, gl.HALF_FLOAT, null);
+    if (this.fullFloat) gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, w, h, 0, gl.RGBA, gl.FLOAT, null);
+    else if (this.floatTarget) gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, w, h, 0, gl.RGBA, gl.HALF_FLOAT, null);
     else gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
@@ -1618,6 +1645,7 @@ class Viewer {
     gl.uniform1f(u.uHQ, hq ? 1 : 0);
     gl.uniform1f(u.uGI, this.gi.enabled && hq && !this.moving && !pick && !probe ? 1 : 0);
     gl.uniform1f(u.uGIStrength, this.gi.strength);
+    gl.uniform1f(u.uGIBounces, this.gi.bounces);
     gl.uniform1f(u.uSeed, this.sample);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
   }

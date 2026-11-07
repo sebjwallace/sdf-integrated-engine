@@ -68,7 +68,11 @@ results.push({ group: 'global illumination', name: 'refines to the chosen sample
 const giDiff = await ev(`(()=>{const a=__off,b=${grab};let changed=0,bad=0;for(let i=0;i<a.length;i+=4){for(let k=0;k<3;k++)if(!Number.isFinite(b[i+k]))bad++;if(Math.abs(b[i]+b[i+1]+b[i+2]-a[i]-a[i+1]-a[i+2])/3>.02)changed++}return {changed:changed/(a.length/4),bad}})()`);
 results.push({ group: 'global illumination', name: 'changes part of the image', value: +giDiff.changed.toFixed(3), pass: giDiff.changed > 0.005 && giDiff.changed < 0.5, want: 'between 0.005 and 0.5' });
 results.push({ group: 'global illumination', name: 'no NaN or infinite pixels', value: giDiff.bad, pass: giDiff.bad === 0, want: '0' });
-await ev('viewer.setGI({enabled:false,strength:1,samples:64});1');
+await ev('viewer.setGI({bounces:2,samples:16});1');
+const twoBounces = await until('viewer.sample>=16', 120000);
+const badTwo = twoBounces < 0 ? -1 : await ev(`(()=>{const b=${grab};let bad=0;for(let i=0;i<b.length;i+=4)for(let k=0;k<3;k++)if(!Number.isFinite(b[i+k]))bad++;return bad})()`);
+results.push({ group: 'global illumination', name: 'two bounces refine without NaN', value: badTwo, pass: badTwo === 0, want: '0' });
+await ev('viewer.setGI({enabled:false,strength:1,samples:32,bounces:1});1');
 results.push({ group: 'page', name: 'no console errors', value: errors.length, pass: errors.length === 0, want: '0' });
 
 let group = '';

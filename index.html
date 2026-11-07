@@ -35,10 +35,15 @@
       <label for="gi-samples">Samples</label>
       <select id="gi-samples">
         <option value="16">16</option>
-        <option value="32">32</option>
-        <option value="64" selected>64</option>
+        <option value="32" selected>32</option>
+        <option value="64">64</option>
         <option value="128">128</option>
         <option value="256">256</option>
+      </select>
+      <label for="gi-bounces">Bounces</label>
+      <select id="gi-bounces" title="Two bounces light deep corners, at about 1.5 times the cost">
+        <option value="1" selected>1</option>
+        <option value="2">2</option>
       </select>
     </div>
     <div class="row" role="group" aria-label="Transform">
@@ -204,14 +209,16 @@
       const giStrength = document.getElementById('gi-strength');
       const giStrengthValue = document.getElementById('gi-strength-value');
       const giSamples = document.getElementById('gi-samples');
+      const giBounces = document.getElementById('gi-bounces');
       const setGI = (change) => {
         viewer.setGI(change);
-        const { enabled, strength, samples } = viewer.gi;
+        const { enabled, strength, samples, bounces } = viewer.gi;
         giButton.setAttribute('aria-pressed', enabled);
         giStrength.value = Math.round(strength * 100);
         giStrengthValue.textContent = `${Math.round(strength * 100)}%`;
         giSamples.value = samples;
-        giStrength.disabled = giSamples.disabled = !enabled;
+        giBounces.value = bounces;
+        giStrength.disabled = giSamples.disabled = giBounces.disabled = !enabled;
         try { localStorage.setItem('gi', JSON.stringify(viewer.gi)); } catch {}
       };
       let savedGI = {};
@@ -219,11 +226,13 @@
       setGI({
         enabled: savedGI.enabled === true,
         strength: Number.isFinite(savedGI.strength) ? Math.min(2, Math.max(0, savedGI.strength)) : 1,
-        samples: [16, 32, 64, 128, 256].includes(savedGI.samples) ? savedGI.samples : 64,
+        samples: [16, 32, 64, 128, 256].includes(savedGI.samples) ? savedGI.samples : 32,
+        bounces: savedGI.bounces === 2 ? 2 : 1,
       });
       giButton.addEventListener('click', () => setGI({ enabled: !viewer.gi.enabled }));
       giStrength.addEventListener('input', () => setGI({ strength: giStrength.value / 100 }));
       giSamples.addEventListener('change', () => setGI({ samples: +giSamples.value }));
+      giBounces.addEventListener('change', () => setGI({ bounces: +giBounces.value }));
 
       modePicker.addEventListener('change', () => viewer.setMode(modePicker.value));
       gridPicker.addEventListener('change', () => viewer.setGrid(+gridPicker.value));

@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openPage, sleep } from './browser.mjs';
+import { transformChecks } from './transform.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const page = await openPage();
@@ -49,6 +50,7 @@ for (const scene of ['car', 'robot', 'mug']) {
   const ok = await ev('document.getElementById("error").hidden');
   results.push({ group: 'page', name: `${scene} loads`, value: ok, pass: ok, want: 'true' });
 }
+results.push(...await transformChecks(page));
 results.push({ group: 'page', name: 'no console errors', value: errors.length, pass: errors.length === 0, want: '0' });
 
 let group = '';

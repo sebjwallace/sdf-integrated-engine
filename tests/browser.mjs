@@ -20,7 +20,7 @@ export async function openPage({ port = 9400, timeout = 600000 } = {}) {
   const close = async () => {
     chrome.kill();
     await Promise.race([exited, sleep(3000)]);
-    rmSync(profile, { recursive: true, force: true });
+    rmSync(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   };
   const watchdog = setTimeout(async () => { console.error('Timed out.'); await close(); process.exit(3); }, timeout);
   let tabs;

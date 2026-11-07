@@ -16,6 +16,12 @@
 // and parts given the same name are one object. A hidden object's distance is
 // pushed far away by a uniform, so hiding needs no recompiling.
 //
+// Each object can also be moved, turned and scaled after compiling, by the
+// uObjM, uObjO and uObjS uniforms (see Viewer.setObjectTransform). The change is
+// made in the space the object is named in, so name objects outside any
+// mirror(), polar() or grid(), or a move would happen in every copy at once.
+// shape.d sees the same change, through the object's `holder`.
+//
 // shape.pose('elbow') marks a joint: a rotation and position supplied from
 // JavaScript every frame, so a scene can animate without recompiling.
 //
@@ -70,16 +76,26 @@ const SDF = (() => {
   // One Ctx writes one GLSL function body. `full` selects Hit values with
   // materials rather than bare floats; every shape below works in both modes.
   class Ctx {
-    constructor(full, funcs, joints, objects) {
+    constructor(full, funcs, joints, objects, frames, holders) {
       this.full = full;
       this.funcs = funcs;
       this.joints = joints;
       this.objects = objects;
+      this.frames = frames;
+      this.holders = holders;
       this.lines = [];
       this.n = 0;
       this.cache = new Map();
       this.materials = [];
       this.tagged = new Map();
+      // The space operations between the root and the shape being written, so
+      // an object can say which frame its own transform is applied in.
+      this.path = [];
+    }
+    // Writes a child inside a change of space, remembering the change.
+    inside(step, fn) {
+      this.path.push(step);
+      try { return fn(); } finally { this.path.pop(); }
     }
     object(name) {
       if (!this.objects.includes(name)) this.objects.push(name);
@@ -106,6 +122,13 @@ const SDF = (() => {
       const seen = this.cache.get(shape);
       if (!seen.has(key)) seen.set(key, emit(this, p, m));
       return seen.get(key);
+    }
+    // Remembers the frame an object is named in, and who holds its transform.
+    named(id, holder) {
+      if (!this.frames[id]) this.frames[id] = [...this.path];
+      if (!this.holders[id]) this.holders[id] = [];
+      if (!this.holders[id].includes(holder)) this.holders[id].push(holder);
+      this.namedCount = Math.max(this.namedCount || 0, id + 1);
     }
     joint(name) {
       if (!this.joints.includes(name)) this.joints.push(name);
@@ -140,7 +163,7 @@ const SDF = (() => {
     move(x = 0, y = 0, z = 0) {
       const { d } = this;
       return new Shape(
-        (c, p, m) => this.emit(c, c.let('vec3', `${p}-${vec([x, y, z])}`), m),
+        (c, p, m) => c.inside({ move: [x, y, z] }, () => this.emit(c, c.let('vec3', `${p}-${vec([x, y, z])}`), m)),
         (px, py, pz) => d(px - x, py - y, pz - z),
       );
     }
@@ -150,7 +173,7 @@ const SDF = (() => {
       const { d } = this;
       const [a, b, e, g, h, i, j, k, l] = rows;
       return new Shape(
-        (c, p, m) => this.emit(c, c.let('vec3', `mat3(${rows.map(f).join(',')})*${p}`), m),
+        (c, p, m) => c.inside({ rotate: rows }, () => this.emit(c, c.let('vec3', `mat3(${rows.map(f).join(',')})*${p}`), m)),
         // GLSL's constructor takes columns, so this multiplies by R's transpose.
         (px, py, pz) => d(a * px + g * py + j * pz, b * px + h * py + k * pz, e * px + i * py + l * pz),
       );
@@ -160,13 +183,13 @@ const SDF = (() => {
     pose(name) {
       return new Shape((c, p, m) => {
         const i = c.joint(name);
-        return this.emit(c, c.let('vec3', `uJointR[${i}]*(${p}-uJointT[${i}])`), m);
+        return c.inside({ joint: i }, () => this.emit(c, c.let('vec3', `uJointR[${i}]*(${p}-uJointT[${i}])`), m));
       }, this.d);
     }
     scale(s) {
       const { d } = this;
       return new Shape(
-        (c, p, m) => c.remap(this.emit(c, c.let('vec3', `${p}/${f(s)}`), m), (v) => `${v}*${f(s)}`),
+        (c, p, m) => c.inside({ scale: s }, () => c.remap(this.emit(c, c.let('vec3', `${p}/${f(s)}`), m), (v) => `${v}*${f(s)}`)),
         (x, y, z) => d(x / s, y / s, z / s) * s,
       );
     }
@@ -189,7 +212,7 @@ const SDF = (() => {
       return new Shape((c, p, m) => {
         const q = c.let('vec3', p);
         for (const a of axes) c.lines.push(`${q}.${a}=abs(${q}.${a});`);
-        return this.emit(c, q, m);
+        return c.inside({ fold: 'mirror' }, () => this.emit(c, q, m));
       }, (x, y, z) => d(mx ? Math.abs(x) : x, my ? Math.abs(y) : y, mz ? Math.abs(z) : z));
     }
     // n copies around an axis. Model the shape on the first listed axis:
@@ -212,7 +235,7 @@ const SDF = (() => {
       return new Shape((c, p, m) => {
         const q = c.let('vec3', p);
         c.lines.push(`${q}.${plane}=polarFold(${q}.${plane},${f(n)});`);
-        return this.emit(c, q, m);
+        return c.inside({ fold: 'polar' }, () => this.emit(c, q, m));
       }, js);
     }
     // Finite grid: spacing [x,y,z], and copies either side of centre [x,y,z].
@@ -222,7 +245,7 @@ const SDF = (() => {
       const [sx, sy, sz] = spacing.map((v) => v || 1);
       const wrap = (v, size, n) => v - size * Math.max(-n, Math.min(n, Math.round(v / size)));
       return new Shape(
-        (c, p, m) => this.emit(c, c.let('vec3', `${p}-${s}*clamp(round(${p}/${s}),-${vec(count)},${vec(count)})`), m),
+        (c, p, m) => c.inside({ fold: 'grid' }, () => this.emit(c, c.let('vec3', `${p}-${s}*clamp(round(${p}/${s}),-${vec(count)},${vec(count)})`), m)),
         (x, y, z) => d(wrap(x, sx, count[0]), wrap(y, sy, count[1]), wrap(z, sz, count[2])),
       );
     }
@@ -232,7 +255,7 @@ const SDF = (() => {
         const a = c.let('float', `${p}.y*${f(k)}`);
         const q = c.let('vec3', `vec3(cos(${a})*${p}.x-sin(${a})*${p}.z,${p}.y,sin(${a})*${p}.x+cos(${a})*${p}.z)`);
         // Twisting stretches space, so shrink the distance to stay safe.
-        return c.remap(this.emit(c, q, m), (v) => `${v}/sqrt(1.+${f(k * k)}*dot(${p}.xz,${p}.xz))`);
+        return c.inside({ fold: 'twist' }, () => c.remap(this.emit(c, q, m), (v) => `${v}/sqrt(1.+${f(k * k)}*dot(${p}.xz,${p}.xz))`));
       }, (x, y, z) => {
         const a = y * k;
         const co = Math.cos(a);
@@ -248,12 +271,43 @@ const SDF = (() => {
       return new Shape((c, p, m) => this.emit(c, p, c.tag(own, m.id)), this.d);
     }
 
+    // Stretches by [sx, sy, sz] about the point `about`. Uneven stretching
+    // makes the distance an underestimate, which is safe: the surface is exact.
+    stretch([sx, sy, sz], about = [0, 0, 0]) {
+      const { d } = this;
+      const [ax, ay, az] = about;
+      const k = Math.min(sx, sy, sz);
+      return new Shape(
+        (c, p, m) => c.inside({ fold: 'stretch' }, () => c.remap(
+          this.emit(c, c.let('vec3', `${vec(about)}+(${p}-${vec(about)})/${vec([sx, sy, sz])}`), m),
+          (v) => `${v}*${f(k)}`,
+        )),
+        (x, y, z) => d(ax + (x - ax) / sx, ay + (y - ay) / sy, az + (z - az) / sz) * k,
+      );
+    }
+
     // An object for the outliner. Inner names win over outer ones, as paint does.
+    // Its transform maps a point to local = M * point + O, then scales the
+    // distance by s. The holder carries the same numbers for shape.d.
     named(name) {
-      return new Shape((c, p, m) => {
+      const { d } = this;
+      const holder = { M: null, O: [0, 0, 0], s: 1 };
+      const shape = new Shape((c, p, m) => {
         const id = c.object(name);
-        return c.hide(this.emit(c, p, c.tag(m, id)), id);
-      }, this.d);
+        c.named(id, holder);
+        const q = c.let('vec3', `uObjM[${id}]*${p}+uObjO[${id}]`);
+        return c.hide(c.remap(this.emit(c, q, c.tag(m, id)), (v) => `${v}*uObjS[${id}]`), id);
+      }, (x, y, z) => {
+        const { M, O, s } = holder;
+        if (!M) return d(x, y, z);
+        return d(
+          M[0] * x + M[1] * y + M[2] * z + O[0],
+          M[3] * x + M[4] * y + M[5] * z + O[1],
+          M[6] * x + M[7] * y + M[8] * z + O[2],
+        ) * s;
+      });
+      shape.holder = holder;
+      return shape;
     }
   }
 
@@ -446,12 +500,18 @@ const SDF = (() => {
     const out = c.let(c.full ? 'Hit' : 'float', c.full ? `applyEditsHit(${first},${p})` : `applyEdits(${first},${p})`);
     const nearest = c.full ? `${out}.d` : out;
     c.lines.push(`if(uHideBodies<.5&&bodyLowerBound(${p})<${nearest}){`);
+    // Each body can be stretched about its centre of mass: xyz holds 1 / the
+    // stretch, w the distance scale. Its bounding radius changes with it.
+    const decl = `uniform vec4 uBodyScale[${bodies.length}];\nuniform float uBodyRadius[${bodies.length}];`;
+    if (!c.funcs.includes(decl)) c.funcs.unshift(decl);
     bodies.forEach((body, i) => {
       const j = c.joint(`body${i}`);
       const id = c.object(body.name || `Body ${i + 1}`);
-      c.lines.push(`if(uHidden[${id}]<.5&&length(${p}-uJointT[${j}])-${f(body.radius)}<${nearest}){`);
+      c.lines.push(`if(uHidden[${id}]<.5&&length(${p}-uJointT[${j}])-uBodyRadius[${i}]<${nearest}){`);
       const q = c.let('vec3', `uJointR[${j}]*(${p}-uJointT[${j}])`);
-      const v = body.shape.emit(c, q, c.tag(m, id));
+      const com = vec(body.com || [0, 0, 0]);
+      const qs = c.let('vec3', `${com}+(${q}-${com})*uBodyScale[${i}].xyz`);
+      const v = c.remap(body.shape.emit(c, qs, c.tag(m, id)), (d) => `${d}*uBodyScale[${i}].w`);
       c.lines.push(c.full ? `${out}=hUnion(${out},${v});}` : `${out}=min(${out},${v});}`);
     });
     c.lines.push('}');
@@ -464,9 +524,13 @@ const SDF = (() => {
     const funcs = [];
     const joints = [];
     const objects = [];
+    const frames = [];
+    const holders = [];
+    let namedCount = 0;
     const body = (full) => {
-      const ctx = new Ctx(full, funcs, joints, objects);
+      const ctx = new Ctx(full, funcs, joints, objects, frames, holders);
       const result = shape.emit(ctx, 'p', DEFAULT_MATERIAL);
+      namedCount = Math.max(namedCount, ctx.namedCount || 0);
       return `${ctx.lines.join('\n  ')}\n  return ${result};`;
     };
     const dist = body(false);
@@ -474,9 +538,15 @@ const SDF = (() => {
     const n = joints.length;
     let uniforms = n ? `uniform mat3 uJointR[${n}];\nuniform vec3 uJointT[${n}];\n` : '';
     if (objects.length) uniforms += `uniform float uHidden[${objects.length}];\n`;
+    if (namedCount) uniforms += `uniform mat3 uObjM[${namedCount}];\nuniform vec3 uObjO[${namedCount}];\nuniform float uObjS[${namedCount}];\n`;
     return {
       joints,
       objects,
+      // For each named object: the space operations above it, outermost first,
+      // and the holders its CPU distance reads. Bodies have neither.
+      frames,
+      holders,
+      namedCount,
       code: `${uniforms}${funcs.join('\n')}
 float treeMap(vec3 p){\n  ${dist}\n}
 Hit treeHit(vec3 p){\n  ${full}\n}`,

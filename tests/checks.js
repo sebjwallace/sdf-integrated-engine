@@ -276,9 +276,10 @@ window.runChecks = () => {
       check('anchor', 'eye threads a thin peg (distance from axis)', +Math.hypot(e[0], e[2]).toFixed(3), Math.hypot(e[0], e[2]) < 0.1, '< 0.1');
     }
     {
-      // Known and open: a thin peg's tip driven into the end of the thin shaft.
+      // A thin peg's tip meeting the anchor end-on. It must start clear of the peg:
+      // an earlier version of this test spawned the anchor already speared on it.
       const peg = cylinder(0.05, 2).move(0, 1, 0); const w = new PhysicsWorld({ world: peg.d });
-      const b = w.add(ANCHOR, { at: [0, 2.6, 0], rotate: [0, 0, 180] });
+      const b = w.add(ANCHOR, { at: [0, 3, 0], rotate: [0, 40, 180] });
       let deep = 0;
       for (let f = 0; f < 300; f++) {
         w.step(1 / 60);
@@ -287,7 +288,29 @@ window.runChecks = () => {
         for (const p of b.info.points) { const r = mulMat3(b.R, p); deep = Math.max(deep, -Math.min(0, peg.d(b.x[0] + r[0], b.x[1] + r[1], b.x[2] + r[2]))); }
         for (let y = 0; y <= 2; y += 0.02) for (let k = 0; k < 8; k++) { const a = k * Math.PI / 4; deep = Math.max(deep, -Math.min(0, b.dist(0.05 * Math.cos(a), y, 0.05 * Math.sin(a)))); }
       }
-      results.push({ group: 'anchor', name: 'thin peg tip into the thin shaft, deepest (m)', value: +deep.toFixed(4), pass: deep < 0.01, want: '< 0.01', open: true });
+      check('anchor', 'thin peg tip meets the anchor end-on, deepest (m)', +deep.toFixed(4), deep < 0.005, '< 0.005');
+    }
+    {
+      // Stress: eight anchors and four rings dropped together, spawned clear of each
+      // other. Tangling thin parts can briefly overlap; this catches it getting worse.
+      const base = SDF.scenes.physics.physics(); const ring = torus(0.36, 0.09);
+      const w = new PhysicsWorld({ world: base.world.d });
+      for (let i = 0; i < 8; i++) w.add(ANCHOR, { at: [Math.sin(i * 2.4) * 0.9, 2.5 + i * 1.6, Math.cos(i * 2.4) * 0.9], rotate: [i * 47, i * 83, i * 29] });
+      for (let i = 0; i < 4; i++) w.add(ring, { at: [Math.sin(i * 1.7 + 1) * 0.6, 1.2 + i * 0.25, Math.cos(i * 1.7 + 1) * 0.6], rotate: [i * 31, 0, i * 17] });
+      const e0 = w.totalEnergy(); let gain = 0, worst = 0;
+      for (let f = 1; f <= 900; f++) {
+        w.step(1 / 60); gain = Math.max(gain, w.totalEnergy() - e0);
+        if (f % 12 === 0) for (let i = 0; i < 8; i++) for (let j = i + 1; j < 12; j++) {
+          const a = w.bodies[i], b = w.bodies[j];
+          if (Math.hypot(a.x[0] - b.x[0], a.x[1] - b.x[1], a.x[2] - b.x[2]) > a.info.radius + b.info.radius) continue;
+          const s = a.info.radius < b.info.radius ? a : b; const r = s.info.radius;
+          worst = Math.max(worst, trueOverlap(a.dist, b.dist, s.x.map((v) => v - r), s.x.map((v) => v + r), 12).depth);
+        }
+      }
+      const outside = w.bodies.filter((b) => Math.abs(b.x[0]) > 5 || Math.abs(b.x[2]) > 5 || b.x[1] < 0.02).length;
+      check('anchor', 'eight anchors and four rings: worst brief overlap (m)', +worst.toFixed(4), worst < 0.03, '< 0.03');
+      check('anchor', 'eight anchors and four rings: energy never rises', +gain.toFixed(4), gain <= 0, '0');
+      check('anchor', 'eight anchors and four rings: nothing escapes', outside, outside === 0, '0');
     }
   }
   return { results, measurements: m };

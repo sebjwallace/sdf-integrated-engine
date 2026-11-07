@@ -51,6 +51,28 @@ for (const scene of ['car', 'robot', 'mug']) {
   results.push({ group: 'page', name: `${scene} loads`, value: ok, pass: ok, want: 'true' });
 }
 results.push(...await transformChecks(page));
+
+// Global illumination: the button turns it on, it refines to its sample count,
+// and it changes the still image without breaking it.
+await ev(`location.hash='mug';1`);
+await sleep(300);
+await until('viewer.usingField', 60000);
+const grab = `(()=>{const v=viewer,gl=v.gl;gl.bindFramebuffer(gl.FRAMEBUFFER,v.fbo);const w=Math.round(v.canvas.width*v.renderScale),h=Math.round(v.canvas.height*v.renderScale);const a=new Float32Array(w*h*4);gl.readPixels(0,0,w,h,gl.RGBA,gl.FLOAT,a);return a})()`;
+await until('viewer.sample>=viewer.maxSamples', 60000);
+await ev(`window.__off=${grab};document.getElementById('gi').click();1`);
+const giOn = await ev('viewer.gi.enabled && !document.getElementById("gi-strength").disabled');
+results.push({ group: 'global illumination', name: 'button turns it on', value: giOn, pass: giOn, want: 'true' });
+await ev('viewer.setGI({strength:2,samples:32});1');
+const refined = await until('viewer.sample>=32', 120000);
+results.push({ group: 'global illumination', name: 'refines to the chosen sample count', value: refined >= 0, pass: refined >= 0, want: 'true' });
+const giDiff = await ev(`(()=>{const a=__off,b=${grab};let changed=0,bad=0;for(let i=0;i<a.length;i+=4){for(let k=0;k<3;k++)if(!Number.isFinite(b[i+k]))bad++;if(Math.abs(b[i]+b[i+1]+b[i+2]-a[i]-a[i+1]-a[i+2])/3>.02)changed++}return {changed:changed/(a.length/4),bad}})()`);
+results.push({ group: 'global illumination', name: 'changes part of the image', value: +giDiff.changed.toFixed(3), pass: giDiff.changed > 0.005 && giDiff.changed < 0.5, want: 'between 0.005 and 0.5' });
+results.push({ group: 'global illumination', name: 'no NaN or infinite pixels', value: giDiff.bad, pass: giDiff.bad === 0, want: '0' });
+await ev('viewer.setGI({bounces:2,samples:16});1');
+const twoBounces = await until('viewer.sample>=16', 120000);
+const badTwo = twoBounces < 0 ? -1 : await ev(`(()=>{const b=${grab};let bad=0;for(let i=0;i<b.length;i+=4)for(let k=0;k<3;k++)if(!Number.isFinite(b[i+k]))bad++;return bad})()`);
+results.push({ group: 'global illumination', name: 'two bounces refine without NaN', value: badTwo, pass: badTwo === 0, want: '0' });
+await ev('viewer.setGI({enabled:false,strength:1,samples:32,bounces:1});1');
 results.push({ group: 'page', name: 'no console errors', value: errors.length, pass: errors.length === 0, want: '0' });
 
 let group = '';

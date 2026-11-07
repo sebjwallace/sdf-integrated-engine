@@ -27,6 +27,25 @@
       <input id="quality" type="range" min="0" max="4" step="1" value="0" aria-describedby="quality-value">
       <output id="quality-value" for="quality">Auto</output>
     </div>
+    <div class="row" role="group" aria-label="Global illumination">
+      <button id="gi" aria-pressed="false" title="Light bounces off one surface onto another. Drawn once the camera stops.">Global illumination</button>
+      <label for="gi-strength">Strength</label>
+      <input id="gi-strength" type="range" min="0" max="200" step="5" value="100" aria-describedby="gi-strength-value">
+      <output id="gi-strength-value" for="gi-strength">100%</output>
+      <label for="gi-samples">Samples</label>
+      <select id="gi-samples">
+        <option value="16">16</option>
+        <option value="32" selected>32</option>
+        <option value="64">64</option>
+        <option value="128">128</option>
+        <option value="256">256</option>
+      </select>
+      <label for="gi-bounces">Bounces</label>
+      <select id="gi-bounces" title="Two bounces light deep corners, at about 1.5 times the cost">
+        <option value="1" selected>1</option>
+        <option value="2">2</option>
+      </select>
+    </div>
     <div class="row" role="group" aria-label="Transform">
       <span class="group-label">Transform</span>
       <button data-gizmo="move" aria-pressed="true" title="Move the selected object (G)">Move</button>
@@ -184,6 +203,36 @@
       try { savedQuality = +localStorage.getItem('quality') || 0; } catch {}
       setQuality(QUALITY[savedQuality] !== undefined ? savedQuality : 0);
       qualitySlider.addEventListener('input', () => setQuality(+qualitySlider.value));
+
+      // Global illumination: on or off, strength and sample count. Remembered too.
+      const giButton = document.getElementById('gi');
+      const giStrength = document.getElementById('gi-strength');
+      const giStrengthValue = document.getElementById('gi-strength-value');
+      const giSamples = document.getElementById('gi-samples');
+      const giBounces = document.getElementById('gi-bounces');
+      const setGI = (change) => {
+        viewer.setGI(change);
+        const { enabled, strength, samples, bounces } = viewer.gi;
+        giButton.setAttribute('aria-pressed', enabled);
+        giStrength.value = Math.round(strength * 100);
+        giStrengthValue.textContent = `${Math.round(strength * 100)}%`;
+        giSamples.value = samples;
+        giBounces.value = bounces;
+        giStrength.disabled = giSamples.disabled = giBounces.disabled = !enabled;
+        try { localStorage.setItem('gi', JSON.stringify(viewer.gi)); } catch {}
+      };
+      let savedGI = {};
+      try { savedGI = JSON.parse(localStorage.getItem('gi')) || {}; } catch {}
+      setGI({
+        enabled: savedGI.enabled === true,
+        strength: Number.isFinite(savedGI.strength) ? Math.min(2, Math.max(0, savedGI.strength)) : 1,
+        samples: [16, 32, 64, 128, 256].includes(savedGI.samples) ? savedGI.samples : 32,
+        bounces: savedGI.bounces === 2 ? 2 : 1,
+      });
+      giButton.addEventListener('click', () => setGI({ enabled: !viewer.gi.enabled }));
+      giStrength.addEventListener('input', () => setGI({ strength: giStrength.value / 100 }));
+      giSamples.addEventListener('change', () => setGI({ samples: +giSamples.value }));
+      giBounces.addEventListener('change', () => setGI({ bounces: +giBounces.value }));
 
       modePicker.addEventListener('change', () => viewer.setMode(modePicker.value));
       gridPicker.addEventListener('change', () => viewer.setGrid(+gridPicker.value));

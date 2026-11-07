@@ -9,13 +9,47 @@
 <body>
   <canvas id="view" aria-label="3D view. Drag to rotate, scroll to zoom."></canvas>
   <header>
-    <label for="scene">Scene</label>
-    <select id="scene"></select>
+    <div class="row">
+      <label for="scene">Scene</label>
+      <select id="scene"></select>
+      <label for="mode">Renderer</label>
+      <select id="mode">
+        <option value="baked">Baked grid</option>
+        <option value="live">Live</option>
+      </select>
+      <label for="grid">Grid</label>
+      <select id="grid">
+        <option value="4000000">4M voxels</option>
+        <option value="16000000" selected>16M voxels</option>
+        <option value="64000000">64M voxels</option>
+      </select>
+    </div>
+    <div class="row" role="group" aria-label="Edit tools">
+      <button data-tool="hole" aria-pressed="false">Add hole</button>
+      <button data-tool="cut" aria-pressed="false">Add box cut</button>
+      <button data-tool="blob" aria-pressed="false">Add blob</button>
+      <button id="clear">Clear edits</button>
+      <button id="pause" hidden>Pause</button>
+    </div>
+    <div class="row" role="group" aria-label="Cutaway">
+      <label for="cut">Cutaway</label>
+      <input id="cut" type="range" min="0" max="100" step="0.5" value="0">
+      <output id="cut-value" for="cut">Off</output>
+      <label for="cut-axis">Axis</label>
+      <select id="cut-axis">
+        <option value="x">X</option>
+        <option value="y">Y</option>
+        <option value="z">Z</option>
+      </select>
+      <button id="cut-flip" aria-pressed="false">Flip side</button>
+    </div>
+    <p id="stats" aria-live="off"></p>
   </header>
-  <p id="hint">Drag to rotate · Scroll to zoom · Shift-drag to pan · Double-click to reset</p>
+  <p id="hint">Drag to rotate · Scroll to zoom · Shift-drag to pan · Double-click to reset<span id="edit-hints"> · Pick a tool, then press on the model · Drag an edit to move it · Scroll over it to resize · Delete removes it</span></p>
   <p id="error" role="alert" hidden></p>
 
   <script src="sdf.js"></script>
+  <script src="field.js"></script>
   <script src="renderer.js"></script>
   <script src="scenes.js"></script>
   <script>
@@ -28,8 +62,51 @@
     };
 
     try {
-      const viewer = new Viewer(document.getElementById('view'), showError);
+      const modePicker = document.getElementById('mode');
+      const gridPicker = document.getElementById('grid');
+      const stats = document.getElementById('stats');
+      const toolButtons = [...document.querySelectorAll('[data-tool]')];
+      const clearButton = document.getElementById('clear');
+      const cutSlider = document.getElementById('cut');
+      const cutAxis = document.getElementById('cut-axis');
+      const cutFlip = document.getElementById('cut-flip');
+      const cutValue = document.getElementById('cut-value');
+      const pauseButton = document.getElementById('pause');
+      const refresh = () => {
+        const v = window.viewer;
+        if (!v) return;
+        stats.textContent = v.describe();
+        if (v.cut) {
+          cutSlider.value = v.cut.amount * 100;
+          cutAxis.value = v.cut.axis;
+          cutFlip.setAttribute('aria-pressed', v.cut.flip);
+          cutValue.textContent = v.cut.amount > 0 ? `${Math.round(v.cut.amount * 100)}%` : 'Off';
+        }
+        const animated = !!v.animation;
+        modePicker.value = animated ? 'live' : v.mode;
+        modePicker.disabled = gridPicker.disabled = clearButton.disabled = animated;
+        pauseButton.hidden = !animated;
+        document.getElementById('edit-hints').hidden = animated;
+        pauseButton.textContent = v.paused ? 'Play' : 'Pause';
+        for (const b of toolButtons) {
+          b.setAttribute('aria-pressed', b.dataset.tool === v.tool);
+          b.disabled = animated;
+        }
+      };
+
+      const viewer = new Viewer(document.getElementById('view'), showError, refresh);
       window.viewer = viewer; // handy from the devtools console
+
+      modePicker.addEventListener('change', () => viewer.setMode(modePicker.value));
+      gridPicker.addEventListener('change', () => viewer.setGrid(+gridPicker.value));
+      clearButton.addEventListener('click', () => viewer.clearEdits());
+      cutSlider.addEventListener('input', () => viewer.setCut({ amount: cutSlider.value / 100 }));
+      cutAxis.addEventListener('change', () => viewer.setCut({ axis: cutAxis.value }));
+      cutFlip.addEventListener('click', () => viewer.setCut({ flip: !viewer.cut.flip }));
+      pauseButton.addEventListener('click', () => viewer.setPaused(!viewer.paused));
+      for (const b of toolButtons) {
+        b.addEventListener('click', () => viewer.setTool(viewer.tool === b.dataset.tool ? 'orbit' : b.dataset.tool));
+      }
 
       for (const [key, scene] of Object.entries(SDF.scenes)) picker.add(new Option(scene.label, key));
 

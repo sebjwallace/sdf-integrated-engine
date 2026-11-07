@@ -8,8 +8,11 @@
 //     sphere(0.5).move(0, 1, 0),
 //   ).smooth(0.2).mirror('x')
 //
-// compile(shape) produces `float map(vec3)` for raymarching and
-// `Hit mapFull(vec3)`, which also carries the material, for shading.
+// compile(shape) produces `float treeMap(vec3)` for raymarching and
+// `Hit treeHit(vec3)`, which also carries the material, for shading.
+//
+// shape.pose('elbow') marks a joint: a rotation and position supplied from
+// JavaScript every frame, so a scene can animate without recompiling.
 
 const SDF = (() => {
   const f = (n) => (+n).toFixed(5);
@@ -30,14 +33,27 @@ const SDF = (() => {
 
   const DEFAULT_MATERIAL = material('#b8b8b8', 0.5);
 
+  // Rows of R = Rz*Ry*Rx, from degrees. Passed as GLSL columns they form R's
+  // inverse, which is what carries a point into a shape's local space.
+  const rotationRows = (x, y, z) => {
+    const r = (d) => (d * Math.PI) / 180;
+    const [cx, sx, cy, sy, cz, sz] = [r(x), r(y), r(z)].flatMap((a) => [Math.cos(a), Math.sin(a)]);
+    return [
+      cz * cy, cz * sy * sx - sz * cx, cz * sy * cx + sz * sx,
+      sz * cy, sz * sy * sx + cz * cx, sz * sy * cx - cz * sx,
+      -sy, cy * sx, cy * cx,
+    ];
+  };
+
   // ---- code generation ---------------------------------------------------
 
   // One Ctx writes one GLSL function body. `full` selects Hit values with
   // materials rather than bare floats; every shape below works in both modes.
   class Ctx {
-    constructor(full, funcs) {
+    constructor(full, funcs, joints) {
       this.full = full;
       this.funcs = funcs;
+      this.joints = joints;
       this.lines = [];
       this.n = 0;
       this.cache = new Map();
@@ -51,6 +67,10 @@ const SDF = (() => {
       const seen = this.cache.get(shape);
       if (!seen.has(key)) seen.set(key, emit(this, p, m));
       return seen.get(key);
+    }
+    joint(name) {
+      if (!this.joints.includes(name)) this.joints.push(name);
+      return this.joints.indexOf(name);
     }
     let(type, expr) {
       const name = `v${this.n++}`;
@@ -80,16 +100,15 @@ const SDF = (() => {
     }
     // Degrees, applied in x, then y, then z order.
     rotate(x = 0, y = 0, z = 0) {
-      const r = (d) => (d * Math.PI) / 180;
-      const [cx, sx, cy, sy, cz, sz] = [r(x), r(y), r(z)].flatMap((a) => [Math.cos(a), Math.sin(a)]);
-      // Rows of R = Rz*Ry*Rx. Passed as GLSL columns they form R's inverse,
-      // which is what we need to carry a point into the shape's local space.
-      const rows = [
-        cz * cy, cz * sy * sx - sz * cx, cz * sy * cx + sz * sx,
-        sz * cy, sz * sy * sx + cz * cx, sz * sy * cx - cz * sx,
-        -sy, cy * sx, cy * cx,
-      ];
+      const rows = rotationRows(x, y, z);
       return new Shape((c, p, m) => this.emit(c, c.let('vec3', `mat3(${rows.map(f).join(',')})*${p}`), m));
+    }
+    // An animated rotate-then-move. The scene's animate() sets it by name.
+    pose(name) {
+      return new Shape((c, p, m) => {
+        const i = c.joint(name);
+        return this.emit(c, c.let('vec3', `uJointR[${i}]*(${p}-uJointT[${i}])`), m);
+      });
     }
     scale(s) {
       return new Shape((c, p, m) => c.remap(this.emit(c, c.let('vec3', `${p}/${f(s)}`), m), (d) => `${d}*${f(s)}`));
@@ -235,20 +254,26 @@ const SDF = (() => {
 
   const compile = (shape) => {
     const funcs = [];
+    const joints = [];
     const body = (full) => {
-      const ctx = new Ctx(full, funcs);
+      const ctx = new Ctx(full, funcs, joints);
       const result = shape.emit(ctx, 'p', DEFAULT_MATERIAL);
       return `${ctx.lines.join('\n  ')}\n  return ${result};`;
     };
     const dist = body(false);
     const full = body(true);
-    return `${funcs.join('\n')}
-float map(vec3 p){\n  ${dist}\n}
-Hit mapFull(vec3 p){\n  ${full}\n}`;
+    const n = joints.length;
+    const uniforms = n ? `uniform mat3 uJointR[${n}];\nuniform vec3 uJointT[${n}];\n` : '';
+    return {
+      joints,
+      code: `${uniforms}${funcs.join('\n')}
+float treeMap(vec3 p){\n  ${dist}\n}
+Hit treeHit(vec3 p){\n  ${full}\n}`,
+    };
   };
 
   return {
     material, sphere, box, ellipsoid, cylinder, cone, torus, capsule, extrude, lathe,
-    union, subtract, intersect, compile, scenes: {},
+    union, subtract, intersect, compile, rotationRows, scenes: {},
   };
 })();

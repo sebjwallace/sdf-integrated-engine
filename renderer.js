@@ -52,16 +52,40 @@ vec2 polarFold(vec2 p,float n){
 }
 `;
 
-const FRAGMENT_SHADER = (sceneCode) => `#version 300 es
+const FRAGMENT_SHADER = (sceneCode, baked) => `#version 300 es
 precision highp float;
+precision highp sampler3D;
 uniform vec2 uRes,uJitter;
 uniform vec3 uEye;
 uniform mat3 uCam;
 uniform vec3 uCenter,uExtent;  // bounding box: everything lives inside this
-uniform float uHQ;
+uniform vec3 uStage;  // floor fade: centre x, centre z, radius
+uniform vec4 uCut;    // cutaway plane: normal, offset. Space beyond it is removed.
+uniform float uHQ,uPick,uMinEps;
 out vec4 fragColor;
 ${SDF_LIBRARY}
 ${sceneCode}
+${EDIT_GLSL}
+float cutPlane(vec3 p){return dot(uCut.xyz,p)-uCut.w;}
+float exactModel(vec3 p){return applyEdits(treeMap(p),p);}
+${baked ? `
+// Baked: distance comes from the cached grid. Outside the grid, add the distance
+// to its edge. Material still comes from the tree, once per hit, so painted
+// details stay sharper than the grid.
+uniform sampler3D uField;
+uniform vec3 uFieldSize;
+const float STEP_LIMIT=${MAX_STEP.toFixed(3)};
+float modelMap(vec3 p){
+  vec3 lo=uCenter-uExtent,q=clamp(p,lo,uCenter+uExtent);
+  return texture(uField,(q-lo)/uFieldSize).r+length(p-q);
+}` : `
+// Live: evaluate the whole scene at every step.
+const float STEP_LIMIT=1e6;
+float modelMap(vec3 p){return exactModel(p);}`}
+// A cutaway is one operation on the distance, so it needs no rebaking.
+float map(vec3 p){return max(modelMap(p),cutPlane(p));}
+float exactMap(vec3 p){return max(exactModel(p),cutPlane(p));}
+Hit mapFull(vec3 p){return applyEditsHit(treeHit(p),p);}
 
 const vec3 KEY=normalize(vec3(.55,.8,.35));
 const vec3 FLOOR=vec3(.03,.032,.037);
@@ -82,7 +106,7 @@ float march(vec3 ro,vec3 rd,int steps){
   for(int i=0;i<steps&&t<r.y;i++){
     d=map(ro+rd*t);
     if(d<.0004*t+.0002)return t;
-    t+=d;
+    t+=min(d,STEP_LIMIT);
   }
   return d<.01&&t<r.y?t:-1.;
 }
@@ -90,6 +114,13 @@ float march(vec3 ro,vec3 rd,int steps){
 vec3 normalAt(vec3 p,float e){
   const vec2 k=vec2(1,-1);
   return normalize(k.xyy*map(p+k.xyy*e)+k.yyx*map(p+k.yyx*e)+k.yxy*map(p+k.yxy*e)+k.xxx*map(p+k.xxx*e));
+}
+
+// The grid finds the surface; final-quality frames then take the normal from the
+// real scene, so reflections keep detail finer than a voxel.
+vec3 exactNormal(vec3 p,float e){
+  const vec2 k=vec2(1,-1);
+  return normalize(k.xyy*exactMap(p+k.xyy*e)+k.yyx*exactMap(p+k.yyx*e)+k.yxy*exactMap(p+k.yxy*e)+k.xxx*exactMap(p+k.xxx*e));
 }
 
 float softShadow(vec3 ro,vec3 rd,float k,int steps){
@@ -100,7 +131,7 @@ float softShadow(vec3 ro,vec3 rd,float k,int steps){
     float h=map(ro+rd*t);
     res=min(res,k*h/t);
     if(res<.002)return 0.;
-    t+=clamp(h,.012,.3);
+    t+=clamp(h,.012,min(.3,STEP_LIMIT));
   }
   res=clamp(res,0.,1.);
   return res*res*(3.-2.*res);
@@ -157,7 +188,7 @@ vec3 reflected(vec3 ro,vec3 rd,float blur){
   if(t<0.)return studio(rd,blur);
   vec3 p=ro+rd*t;
   Hit m=mapFull(p);
-  vec3 n=normalAt(p,.002);
+  vec3 n=normalAt(p,max(.002,uMinEps));
   vec3 c=lightSurface(p,n,rd,m,1.,.75);
   vec3 F=mix(vec3(.05),m.col,m.metal);
   return c+F*studio(reflect(rd,n),max(m.rough,.3));
@@ -165,7 +196,7 @@ vec3 reflected(vec3 ro,vec3 rd,float blur){
 
 vec3 shadeObject(vec3 ro,vec3 rd,float t){
   vec3 p=ro+rd*t;
-  vec3 n=normalAt(p,max(.0006,.0004*t));
+  vec3 n=uHQ>.5?exactNormal(p,max(.0006,.0004*t)):normalAt(p,max(uMinEps,.0004*t));
   Hit m=mapFull(p);
   vec3 q=p+n*.003;
   float ao=occlusion(p,n);
@@ -183,11 +214,11 @@ vec3 shadeObject(vec3 ro,vec3 rd,float t){
 
 vec3 shadeFloor(vec3 ro,vec3 rd,float t){
   vec3 p=ro+rd*t;
-  float dist=length(p.xz-uCenter.xz),R=length(uExtent);
+  float dist=length(p.xz-uStage.xy),R=uStage.z;
   vec3 n=vec3(0,1,0);
-  float sh=1.,ao=1.;
-  if(dist<R*2.5){
-    sh=softShadow(p+n*.002,KEY,9.,uHQ>.5?40:12);
+  float sh=softShadow(p+n*.002,KEY,9.,uHQ>.5?40:12),ao=1.;
+  // Contact shading only reaches about half a unit, so skip it far from the model.
+  if(length(max(abs(p-uCenter)-uExtent,0.))<.6){
     float h=map(p);
     ao=mix(.08,1.,smoothstep(0.,.42,h));
     ao=min(ao,occlusion(p,n));
@@ -202,11 +233,47 @@ vec3 shadeFloor(vec3 ro,vec3 rd,float t){
     if(rt>0.){
       vec3 rp=p+r*rt;
       Hit m=mapFull(rp);
-      vec3 rn=normalAt(rp,.003);
+      vec3 rn=normalAt(rp,max(.003,uMinEps));
       c+=F*lightSurface(rp,rn,r,m,1.,.7)*exp(-rt*1.1);
     }
   }
   return mix(c,backdrop(rd),smoothstep(R*1.6,R*5.,dist));
+}
+
+// The cut face, drawn like an engineering section: flat, hatched, tinted by the
+// part being cut, and outlined where the solid ends or one part meets another.
+vec3 shadeCut(vec3 p,vec3 rd,float t,Hit m){
+  vec3 n=uCut.xyz;
+  p-=n*cutPlane(p);
+  vec3 u=normalize(cross(n,abs(n.x)>.5?vec3(0,1,0):vec3(1,0,0))),v=cross(n,u);
+  float w=.0012*t;
+
+  float spacing=uStage.z*.014;
+  float g=(dot(p,u)+dot(p,v))*.7071/spacing;
+  float footprint=(2.*t/(FOCAL*uRes.y))/(spacing*max(abs(dot(rd,n)),.15));
+  float line=1.-smoothstep(.13-footprint,.13+footprint,abs(fract(g)-.5));
+  line=mix(line,.26,smoothstep(.35,.9,footprint));
+
+  vec3 tint=m.col*.8+vec3(.06);
+  vec3 c=mix(tint,tint*.4,line)*(.82+.18*max(dot(n,KEY),0.));
+
+  float seam=(length(mapFull(p+u*w).col-m.col)>.04||length(mapFull(p+v*w).col-m.col)>.04)?1.:0.;
+  float edge=max(seam,1.-smoothstep(w,w*1.6,-m.d));
+  // Dark lines on pale parts and pale lines on dark ones, so the outline always reads.
+  vec3 ink=dot(tint,vec3(.3,.6,.1))>.3?vec3(.012,.014,.02):vec3(1.,.94,.78);
+  return mix(c,ink,edge);
+}
+
+vec3 shadeHit(vec3 ro,vec3 rd,float t){
+  vec3 p=ro+rd*t;
+  float plane=cutPlane(p);
+  // Only points on the plane can be on the cut face, which keeps this free
+  // whenever nothing is being cut.
+  if(plane>-(.002+.0006*t)){
+    Hit m=mapFull(p);
+    if(m.d<plane+.0012*t)return shadeCut(p,rd,t,m);
+  }
+  return shadeObject(ro,rd,t);
 }
 
 vec3 aces(vec3 x){return clamp(x*(2.51*x+.03)/(x*(2.43*x+.59)+.14),0.,1.);}
@@ -216,8 +283,9 @@ void main(){
   vec3 rd=normalize(uCam*vec3(ndc,FOCAL));
   float tFloor=rd.y<0.?-uEye.y/rd.y:-1.;
   float t=march(uEye,rd,uHQ>.5?128:48);
+  if(uPick>.5){fragColor=vec4(t);return;}
   vec3 c;
-  if(t>0.&&(tFloor<0.||t<tFloor))c=shadeObject(uEye,rd,t);
+  if(t>0.&&(tFloor<0.||t<tFloor))c=shadeHit(uEye,rd,t);
   else if(tFloor>0.)c=shadeFloor(uEye,rd,tFloor);
   else c=backdrop(rd);
   // Soft vignette, tone mapping, gamma.
@@ -225,10 +293,27 @@ void main(){
   fragColor=vec4(pow(aces(c),vec3(1./2.2)),1.);
 }`;
 
+const NO_EDITS = packEdits([]);
+
+// The shapes the edit tools place. Half-sizes are in world units.
+const TOOLS = {
+  hole: { kind: 0, op: 0, size: [0.28, 0.28, 0.28], k: 0.03 },
+  cut: { kind: 1, op: 0, size: [0.3, 0.22, 0.3], k: 0.015 },
+  blob: { kind: 0, op: 1, size: [0.22, 0.22, 0.22], k: 0.1, paint: ['#d9a441', 0.3, 0.1] },
+};
+
 class Viewer {
-  constructor(canvas, onError) {
+  constructor(canvas, onError, onChange = () => {}) {
     this.canvas = canvas;
     this.onError = onError;
+    this.onChange = onChange;
+    this.mode = 'baked';
+    this.gridVoxels = 16e6;
+    this.tool = 'orbit';
+    this.edits = [];
+    this.editPack = packEdits([]);
+    this.frameMs = 16;
+    this.paused = matchMedia('(prefers-reduced-motion: reduce)').matches;
     const gl = (this.gl = canvas.getContext('webgl2', { alpha: false, antialias: false, depth: false, powerPreference: 'high-performance' }));
     if (!gl) throw new Error('This browser does not support WebGL2.');
 
@@ -237,6 +322,17 @@ class Viewer {
     this.present = this.link(PRESENT_SHADER);
     this.fbo = gl.createFramebuffer();
     this.tex = gl.createTexture();
+    if (this.floatTarget) {
+      // A single pixel for asking "what is under the pointer?"
+      this.pickTex = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, this.pickTex);
+      gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA16F, 1, 1);
+      this.pickFbo = gl.createFramebuffer();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.pickFbo);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.pickTex, 0);
+    } else {
+      this.mode = 'live';
+    }
     gl.disable(gl.DEPTH_TEST);
 
     // Camera: spherical coordinates around a target. `goal` is where the
@@ -283,11 +379,32 @@ class Viewer {
   }
 
   setScene(scene) {
-    const shape = scene.build();
-    const program = this.link(FRAGMENT_SHADER(SDF.compile(shape)));
-    if (this.scene) this.gl.deleteProgram(this.scene.prog);
-    this.scene = program;
+    const compiled = SDF.compile(scene.build());
+    this.sceneCode = compiled.code;
+    this.animation = scene.animate ? scene : null;
+    this.clock = 0;
+    this.jointIndex = new Map(compiled.joints.map((name, i) => [name, i]));
+    this.jointR = new Float32Array(compiled.joints.length * 9);
+    this.jointT = new Float32Array(compiled.joints.length * 3);
+    this.cut = null;
+    const program = this.link(FRAGMENT_SHADER(this.sceneCode, false));
+    if (this.live) this.gl.deleteProgram(this.live.prog);
+    this.live = program;
+    this.disposeField();
+    if (this.baked) this.gl.deleteProgram(this.baked.prog);
+    this.baked = null;
+    this.edits = [];
+    this.editPack = packEdits([]);
+    this.dirty = null;
+    this.hover = null;
+    this.grab = null;
+    this.setTool('orbit');
     this.bound = { center: scene.center, extent: scene.extent, radius: Math.hypot(...scene.extent) };
+    // Rays march inside this box. An animated scene moves it along with the model.
+    this.rayBox = { center: scene.center, extent: scene.movingExtent || scene.extent };
+    this.applyPose();
+    this.cut = { axis: scene.cutAxis || 'z', amount: 0, flip: false };
+    this.updateCutPlane();
     this.home = { ...scene.camera, target: scene.center };
     Object.assign(this.cam, this.home);
     Object.assign(this.goal, this.home);
@@ -298,6 +415,254 @@ class Viewer {
     this.moving = moving;
     this.sample = 0;
     this.strip = 0;
+  }
+
+  // ---- renderer modes ---------------------------------------------------------
+
+  get usingField() { return !this.animation && this.mode === 'baked' && !!this.field && this.field.ready; }
+  get active() { return this.usingField ? this.baked : this.live; }
+
+  setMode(mode) {
+    if (this.animation || (mode === 'baked' && !this.floatTarget)) return;
+    this.mode = mode;
+    this.restart(this.moving);
+    this.onChange();
+  }
+
+  setGrid(voxels) {
+    this.gridVoxels = voxels;
+    this.disposeField();
+    this.restart(this.moving);
+    this.onChange();
+  }
+
+  disposeField() {
+    if (this.field) this.field.dispose();
+    this.field = null;
+  }
+
+  startBake() {
+    try {
+      if (!this.baked) {
+        this.baked = this.link(FRAGMENT_SHADER(this.sceneCode, true));
+        this.gl.useProgram(this.baked.prog);
+        this.gl.uniform1i(this.baked.uniforms.uField, 1);
+      }
+      this.field = new DistanceField(this, this.sceneCode, this.bound.center, this.bound.extent, this.gridVoxels);
+    } catch (e) {
+      this.mode = 'live';
+      this.onError(`Could not build the baked renderer, so it is using Live mode.\n${e.message}`);
+    }
+    this.onChange();
+  }
+
+  // Asks the scene for this moment's joints and turns them into uniform data.
+  applyPose() {
+    if (!this.animation) return;
+    const center = this.animation.animate(this.clock, (name, { rotate = [0, 0, 0], move = [0, 0, 0] }) => {
+      const i = this.jointIndex.get(name);
+      if (i === undefined) return;
+      this.jointR.set(SDF.rotationRows(...rotate), i * 9);
+      this.jointT.set(move, i * 3);
+    });
+    if (center) this.rayBox.center = center;
+    if (this.cut) this.updateCutPlane();
+  }
+
+  setPaused(paused) {
+    this.paused = paused;
+    this.onChange();
+  }
+
+  // Bakes a little each frame, then keeps the world texture in step with edits.
+  stepField() {
+    if (this.animation) return;
+    if (this.mode === 'baked' && !this.field && this.sample >= 1) this.startBake();
+    const field = this.field;
+    if (!field) return;
+    if (field.baking) {
+      field.step(12);
+      if (!field.baking) {
+        field.update({ min: field.lo, max: field.lo.map((v, i) => v + field.fieldSize[i]) }, this.edits);
+        field.ready = true;
+        this.dirty = null;
+        this.restart(this.moving);
+      }
+      this.onChange();
+    } else if (this.dirty) {
+      field.update(this.dirty, this.edits);
+      this.dirty = null;
+    }
+  }
+
+  // ---- cutaway ----------------------------------------------------------------
+
+  // amount runs from 0 (whole model) to 1 (all removed) across the scene's box.
+  setCut(change) {
+    Object.assign(this.cut, change);
+    this.updateCutPlane();
+    this.activeUntil = performance.now() + 150;
+    this.onChange();
+  }
+
+  updateCutPlane() {
+    const { axis, amount, flip } = this.cut;
+    if (amount <= 0) {
+      this.cutPlane = [0, 0, 0, 1e6]; // every point is far inside: no cut
+      return;
+    }
+    const i = 'xyz'.indexOf(axis);
+    // The ray box follows an animated model, so its cut travels with it.
+    const lo = this.rayBox.center[i] - this.rayBox.extent[i];
+    const hi = this.rayBox.center[i] + this.rayBox.extent[i];
+    const sign = flip ? -1 : 1;
+    const position = flip ? lo + amount * (hi - lo) : hi - amount * (hi - lo);
+    const normal = [0, 0, 0];
+    normal[i] = sign;
+    this.cutPlane = [...normal, sign * position];
+  }
+
+  // ---- edits ------------------------------------------------------------------
+
+  changed(region) {
+    this.dirty = unionBounds(this.dirty, region);
+    this.editPack = packEdits(this.edits);
+    this.activeUntil = performance.now() + 150;
+    this.onChange();
+  }
+
+  setTool(tool) {
+    if (this.animation) tool = 'orbit';
+    this.tool = tool;
+    this.canvas.classList.toggle('placing', tool !== 'orbit');
+    this.onChange();
+  }
+
+  addEdit(tool, pos) {
+    if (this.edits.length >= MAX_EDITS) {
+      this.onError(`This version supports up to ${MAX_EDITS} edits. Remove one to add another.`);
+      return null;
+    }
+    const { paint, ...shape } = TOOLS[tool];
+    const look = SDF.material(...(paint || ['#808080']));
+    const edit = { ...shape, size: [...shape.size], pos: [...pos], ...look };
+    this.edits.push(edit);
+    this.changed(editBounds(edit));
+    return edit;
+  }
+
+  moveEdit(edit, pos) {
+    const before = editBounds(edit);
+    edit.pos = pos;
+    this.changed(unionBounds(before, editBounds(edit)));
+  }
+
+  resizeEdit(edit, factor) {
+    const before = editBounds(edit);
+    const scale = Math.min(1.5 / Math.max(...edit.size), Math.max(0.04 / Math.min(...edit.size), factor));
+    edit.size = edit.size.map((s) => s * scale);
+    this.changed(unionBounds(before, editBounds(edit)));
+  }
+
+  removeEdit(edit) {
+    this.edits = this.edits.filter((e) => e !== edit);
+    if (this.hover === edit) this.hover = null;
+    this.changed(editBounds(edit));
+  }
+
+  clearEdits() {
+    const region = this.edits.map(editBounds).reduce(unionBounds, null);
+    this.edits = [];
+    this.hover = null;
+    if (region) this.changed(region);
+  }
+
+  pointerRay(x, y) {
+    const { clientWidth: w, clientHeight: h } = this.canvas;
+    const { eye, forward, right, up } = this.basis(this.cam);
+    const u = (2 * x - w) / h;
+    const v = (h - 2 * y) / h;
+    const d = right.map((r, i) => r * u + up[i] * v + forward[i] * 3.2);
+    const len = Math.hypot(...d);
+    return { eye, forward, dir: d.map((c) => c / len) };
+  }
+
+  // Asks the GPU where the pointer's ray hits the model.
+  pickSurface(x, y) {
+    if (!this.pickFbo) return null;
+    const gl = this.gl;
+    const { width, height, clientWidth, clientHeight } = this.canvas;
+    const px = (x * width) / clientWidth;
+    const py = height - (y * height) / clientHeight;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.pickFbo);
+    gl.disable(gl.BLEND);
+    gl.disable(gl.SCISSOR_TEST);
+    gl.viewport(0, 0, 1, 1);
+    this.draw(true, width, height, [px - 0.5, py - 0.5], true);
+    const out = new Float32Array(4);
+    gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.FLOAT, out);
+    if (!(out[0] > 0)) return null;
+    const { eye, dir } = this.pointerRay(x, y);
+    return eye.map((v, i) => v + dir[i] * out[0]);
+  }
+
+  // Nearest edit whose bounding sphere the pointer's ray passes through.
+  editAt(x, y) {
+    const { eye, dir } = this.pointerRay(x, y);
+    let best = null;
+    let bestT = Infinity;
+    for (const e of this.edits) {
+      const r = e.kind === 0 ? e.size[0] : Math.hypot(...e.size) * 0.8;
+      const c = e.pos.map((v, i) => v - eye[i]);
+      const along = c[0] * dir[0] + c[1] * dir[1] + c[2] * dir[2];
+      const gap2 = c[0] * c[0] + c[1] * c[1] + c[2] * c[2] - along * along;
+      if (along > 0 && gap2 < r * r && along < bestT) { best = e; bestT = along; }
+    }
+    return best;
+  }
+
+  // The point under the pointer on a camera-facing plane through `pos`.
+  onDragPlane(x, y, pos) {
+    const { eye, forward, dir } = this.pointerRay(x, y);
+    const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    const t = dot(pos.map((v, i) => v - eye[i]), forward) / dot(dir, forward);
+    return eye.map((v, i) => v + dir[i] * t);
+  }
+
+  grabEdit(edit, x, y) {
+    const hit = this.pickSurface(x, y) || this.onDragPlane(x, y, edit.pos);
+    this.grab = { edit, offset: edit.pos.map((v, i) => v - hit[i]) };
+  }
+
+  dragEdit(x, y) {
+    // Follow the model's surface; off the model, slide on a camera-facing plane.
+    const { edit, offset } = this.grab;
+    const hit = this.pickSurface(x, y);
+    this.moveEdit(edit, hit ? hit.map((v, i) => v + offset[i]) : this.onDragPlane(x, y, edit.pos));
+  }
+
+  describe() {
+    const f = this.field;
+    if (this.animation) {
+      return this.paused
+        ? 'Paused · refining to full quality'
+        : `Animated with ${this.jointIndex.size} joints · Live · ${(this.previewScale * 100).toFixed(0)}% resolution · ${this.frameMs.toFixed(0)} ms/frame`;
+    }
+    if (this.mode === 'live') return `Live: evaluating the whole scene at every ray step · ${this.frameMs.toFixed(0)} ms/frame`;
+    if (!f) return 'Compiling shaders…';
+    if (f.baking) return `Baking ${Math.round(f.progress * 100)}% · showing Live until it finishes`;
+    const mb = Math.round((f.voxelCount * 2 * 2) / 1e6);
+    const parts = [
+      `Grid ${f.dims.join('×')}`,
+      `${(f.voxelCount / 1e6).toFixed(1)}M voxels, ${(f.voxel * 100).toFixed(1)} cm`,
+      `${mb} MB`,
+      `baked in ${(f.bakeMs / 1000).toFixed(1)} s`,
+      `${this.frameMs.toFixed(0)} ms/frame`,
+    ];
+    if (this.edits.length) {
+      parts.push(`${this.edits.length} edit${this.edits.length > 1 ? 's' : ''}, last update ${(f.lastUpdate / 1e6).toFixed(2)}M voxels`);
+    }
+    return parts.join(' · ');
   }
 
   resize() {
@@ -332,15 +697,34 @@ class Viewer {
       pointers.set(e.pointerId, [e.clientX, e.clientY]);
       c.classList.add('dragging');
       pinch = 0;
+      this.grab = null;
+      if (pointers.size > 1 || e.button !== 0 || e.shiftKey) return;
+      if (this.tool !== 'orbit') {
+        const hit = this.pickSurface(e.clientX, e.clientY);
+        const edit = hit && this.addEdit(this.tool, hit);
+        if (edit) {
+          this.setTool('orbit');
+          this.grabEdit(edit, e.clientX, e.clientY);
+        }
+      } else {
+        const edit = this.editAt(e.clientX, e.clientY);
+        if (edit) this.grabEdit(edit, e.clientX, e.clientY);
+      }
     });
     c.addEventListener('pointermove', (e) => {
       const last = pointers.get(e.pointerId);
-      if (!last) return;
+      if (!last) {
+        this.hover = this.editAt(e.clientX, e.clientY);
+        c.classList.toggle('over-edit', !!this.hover);
+        return;
+      }
       const dx = e.clientX - last[0];
       const dy = e.clientY - last[1];
       last[0] = e.clientX;
       last[1] = e.clientY;
-      if (pointers.size === 2) {
+      if (this.grab && pointers.size === 1) {
+        this.dragEdit(e.clientX, e.clientY);
+      } else if (pointers.size === 2) {
         const [a, b] = [...pointers.values()];
         const gap = Math.hypot(a[0] - b[0], a[1] - b[1]);
         if (pinch) this.zoom(pinch / gap);
@@ -355,6 +739,7 @@ class Viewer {
     const release = (e) => {
       pointers.delete(e.pointerId);
       pinch = 0;
+      this.grab = null;
       if (!pointers.size) c.classList.remove('dragging');
     };
     c.addEventListener('pointerup', release);
@@ -363,9 +748,16 @@ class Viewer {
     c.addEventListener('wheel', (e) => {
       e.preventDefault();
       const unit = e.deltaMode === 1 ? 16 : 1;
-      this.zoom(Math.exp(e.deltaY * unit * (e.ctrlKey ? 0.01 : 0.0015)));
+      const factor = Math.exp(e.deltaY * unit * (e.ctrlKey ? 0.01 : 0.0015));
+      if (this.hover) this.resizeEdit(this.hover, 1 / factor);
+      else this.zoom(factor);
     }, { passive: false });
-    c.addEventListener('dblclick', () => Object.assign(this.goal, this.home));
+    c.addEventListener('dblclick', () => { if (!this.hover) Object.assign(this.goal, this.home); });
+    addEventListener('keydown', (e) => {
+      if (e.target.closest && e.target.closest('select')) return;
+      if ((e.key === 'Delete' || e.key === 'Backspace') && this.hover) this.removeEdit(this.hover);
+      if (e.key === 'Escape') this.setTool('orbit');
+    });
   }
 
   zoom(factor) {
@@ -410,17 +802,37 @@ class Viewer {
     return true;
   }
 
-  draw(hq, width, height, jitter) {
+  draw(hq, width, height, jitter, pick = false) {
     const gl = this.gl;
     const { eye, forward, right, up } = this.basis(this.cam);
-    const u = this.scene.uniforms;
-    gl.useProgram(this.scene.prog);
+    const program = this.active;
+    const u = program.uniforms;
+    gl.useProgram(program.prog);
+    const voxel = this.usingField ? this.field.voxel : 0;
+    gl.uniform1f(u.uMinEps, Math.max(0.0006, voxel));
+    gl.uniform1f(u.uCutDepth, Math.max(0.012, voxel * 1.5));
+    gl.uniform1f(u.uPick, pick ? 1 : 0);
+    gl.uniform4fv(u.uCut, this.cutPlane);
+    // Picking looks at the unedited model, so a hole can glide along the surface
+    // without falling into itself.
+    setEditUniforms(gl, u, pick ? NO_EDITS : this.editPack);
+    if (this.usingField) {
+      gl.uniform3fv(u.uFieldSize, this.field.fieldSize);
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_3D, pick ? this.field.base : this.field.world);
+      gl.activeTexture(gl.TEXTURE0);
+    }
     gl.uniform2f(u.uRes, width, height);
     gl.uniform2f(u.uJitter, jitter[0], jitter[1]);
     gl.uniform3fv(u.uEye, eye);
     gl.uniformMatrix3fv(u.uCam, false, [...right, ...up, ...forward]);
-    gl.uniform3fv(u.uCenter, this.bound.center);
-    gl.uniform3fv(u.uExtent, this.bound.extent);
+    gl.uniform3fv(u.uCenter, this.rayBox.center);
+    gl.uniform3fv(u.uExtent, this.rayBox.extent);
+    gl.uniform3f(u.uStage, this.bound.center[0], this.bound.center[2], this.bound.radius);
+    if (this.jointIndex.size) {
+      gl.uniformMatrix3fv(u['uJointR[0]'], false, this.jointR);
+      gl.uniform3fv(u['uJointT[0]'], this.jointT);
+    }
     gl.uniform1f(u.uHQ, hq ? 1 : 0);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
   }
@@ -441,12 +853,20 @@ class Viewer {
     requestAnimationFrame((t) => this.frame(t));
     const dt = now - (this.lastFrame || now);
     this.lastFrame = now;
-    if (!this.scene) return;
+    if (!this.live) return;
 
     const gl = this.gl;
     const { width, height } = this.canvas;
-    if (this.ease()) this.restart(true);
+    this.stepField();
+    const animating = this.animation && !this.paused;
+    if (animating) {
+      this.clock += Math.min(dt, 100) / 1000;
+      this.applyPose();
+    }
+    if (this.ease() || animating || now < (this.activeUntil || 0)) this.restart(true);
     else if (this.moving) this.restart(false);
+    if (this.moving) this.frameMs += (dt - this.frameMs) * 0.1;
+    if (now - (this.lastStatus || 0) > 250) { this.lastStatus = now; this.onChange(); }
 
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbo);
 
@@ -461,13 +881,16 @@ class Viewer {
       gl.disable(gl.BLEND);
       gl.disable(gl.SCISSOR_TEST);
       gl.viewport(0, 0, w, h);
-      this.draw(false, w, h, [0, 0]);
+      // Animated scenes are the final image, so keep shadows and reflections on.
+      this.draw(!!this.animation, w, h, [0, 0]);
       this.show(w / width, h / height);
       this.drewLast = true;
       return;
     }
 
     if (this.sample >= this.maxSamples) { this.drewLast = false; return; }
+    // While baking, one sample is enough to look at. Leave the GPU to the bake.
+    if (this.field && this.field.baking && this.sample >= 1) return;
 
     // Refine: each sample is split into strips across several frames on slower
     // GPUs, so a heavy scene cannot stall the browser.

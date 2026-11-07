@@ -30,6 +30,7 @@
       <button data-tool="blob" aria-pressed="false">Add blob</button>
       <button id="clear">Clear edits</button>
       <button id="pause" hidden>Pause</button>
+      <button id="drop" hidden>Drop again</button>
     </div>
     <div class="row" role="group" aria-label="Cutaway">
       <label for="cut">Cutaway</label>
@@ -45,11 +46,12 @@
     </div>
     <p id="stats" aria-live="off"></p>
   </header>
-  <p id="hint">Drag to rotate · Scroll to zoom · Shift-drag to pan · Double-click to reset<span id="edit-hints"> · Pick a tool, then press on the model · Drag an edit to move it · Scroll over it to resize · Delete removes it</span></p>
+  <p id="hint">Drag to rotate · Scroll to zoom · Shift-drag to pan · Double-click to reset<span id="edit-hints"> · Pick a tool, then press on the model · Drag an edit to move it · Scroll over it to resize · Delete removes it</span><span id="physics-hint" hidden> · Drag a body to throw it</span></p>
   <p id="error" role="alert" hidden></p>
 
   <script src="sdf.js"></script>
   <script src="field.js"></script>
+  <script src="physics.js"></script>
   <script src="renderer.js"></script>
   <script src="scenes.js"></script>
   <script>
@@ -72,6 +74,7 @@
       const cutFlip = document.getElementById('cut-flip');
       const cutValue = document.getElementById('cut-value');
       const pauseButton = document.getElementById('pause');
+      const dropButton = document.getElementById('drop');
       const refresh = () => {
         const v = window.viewer;
         if (!v) return;
@@ -83,10 +86,13 @@
           cutValue.textContent = v.cut.amount > 0 ? `${Math.round(v.cut.amount * 100)}%` : 'Off';
         }
         const animated = !!v.animation;
-        modePicker.value = animated ? 'live' : v.mode;
-        modePicker.disabled = gridPicker.disabled = clearButton.disabled = animated;
-        pauseButton.hidden = !animated;
+        modePicker.value = v.liveOnly ? 'live' : v.mode;
+        modePicker.disabled = gridPicker.disabled = v.liveOnly;
+        clearButton.disabled = animated;
+        pauseButton.hidden = !v.liveOnly;
+        dropButton.hidden = !v.sim;
         document.getElementById('edit-hints').hidden = animated;
+        document.getElementById('physics-hint').hidden = !v.sim;
         pauseButton.textContent = v.paused ? 'Play' : 'Pause';
         for (const b of toolButtons) {
           b.setAttribute('aria-pressed', b.dataset.tool === v.tool);
@@ -104,6 +110,7 @@
       cutAxis.addEventListener('change', () => viewer.setCut({ axis: cutAxis.value }));
       cutFlip.addEventListener('click', () => viewer.setCut({ flip: !viewer.cut.flip }));
       pauseButton.addEventListener('click', () => viewer.setPaused(!viewer.paused));
+      dropButton.addEventListener('click', () => viewer.dropAgain());
       for (const b of toolButtons) {
         b.addEventListener('click', () => viewer.setTool(viewer.tool === b.dataset.tool ? 'orbit' : b.dataset.tool));
       }

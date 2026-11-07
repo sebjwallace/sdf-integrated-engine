@@ -288,6 +288,69 @@ SDF.scenes.valve = {
   },
 };
 
+// Bodies dropped into an uneven tray. The world and every body are plain SDFs,
+// including the ring, the arch and the peg, none of which are convex.
+SDF.scenes.physics = {
+  label: 'Physics playground',
+  center: [0, 2.4, 0],
+  extent: [5.2, 2.5, 5.2],
+  camera: { theta: 32, phi: 40, dist: 20 },
+  cutAxis: 'z',
+  toolScale: 2.4,
+  physics() {
+    const { box, sphere, cylinder, torus, capsule, union, subtract, material } = SDF;
+    const ground = material('#3a4048', 0.55, 0.1);
+    const fixture = material('#b8bcc2', 0.3, 1);
+
+    const tray = subtract(
+      box(9.4, 1.05, 9.4).round(0.04).move(0, 0.525, 0),
+      box(8.6, 2, 8.6).move(0, 1.6, 0),
+    );
+    const hills = union(
+      sphere(1.5).move(-2.3, -0.1, 1.5),
+      sphere(1.2).move(1.6, -0.2, 2.2),
+    );
+    const ramp = box(3.4, 0.2, 2).rotate(0, 0, -18).move(2.4, 1, -2.2);
+    const arch = torus(0.95, 0.16).rotate(90).move(-1.9, 0.6, -2.2);
+    const peg = cylinder(0.11, 1.8).move(0.1, 1.3, -0.4);
+
+    const world = union(
+      union(tray, hills).smooth(0.35).paint(ground),
+      ramp.paint('#4f6d7a', 0.4, 0.2),
+      arch.paint(fixture),
+      peg.paint(fixture),
+    );
+
+    const ball = sphere(0.3);
+    const block = box(0.44, 0.44, 0.44).round(0.04);
+    const pill = capsule([0, -0.26, 0], [0, 0.26, 0], 0.17);
+    const ring = torus(0.36, 0.09);
+    const palette = ['#d9534f', '#e0a33a', '#5cb270', '#4f9bd9', '#a06cd5', '#e8e2d4'];
+    const shapes = [ball, block, pill, ball, block, ring];
+
+    const bodies = [];
+    let n = 0;
+    for (let layer = 0; layer < 3; layer++) {
+      for (let i = 0; i < 3; i++) {
+        for (let j = 0; j < 3; j++) {
+          const kind = shapes[n % shapes.length];
+          const shape = kind.paint(palette[n % palette.length], 0.32);
+          bodies.push({
+            shape,
+            at: [(i - 1) * 1.5 + 0.1 * layer, 3 + layer * 0.9, (j - 1) * 1.5 - 0.1 * layer],
+            rotate: [n * 37, n * 53, n * 11],
+          });
+          n++;
+        }
+      }
+    }
+    // These two rings start directly over the peg, to test threading a hole.
+    const hoop = ring.paint('#f2f2f2', 0.3);
+    bodies.push({ shape: hoop, at: [0.1, 2.7, -0.4], rotate: [6, 0, 4] });
+    return { world, bodies };
+  },
+};
+
 SDF.scenes.mug = {
   label: 'Coffee mug',
   center: [0.25, 0.75, 0],

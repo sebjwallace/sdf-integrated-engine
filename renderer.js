@@ -52,7 +52,7 @@ vec2 polarFold(vec2 p,float n){
 }
 `;
 
-const FRAGMENT_SHADER = (sceneCode, baked) => `#version 300 es
+const FRAGMENT_SHADER = (sceneCode, baked, editsInTree = false) => `#version 300 es
 precision highp float;
 precision highp sampler3D;
 uniform vec2 uRes,uJitter;
@@ -61,13 +61,21 @@ uniform mat3 uCam;
 uniform vec3 uCenter,uExtent;  // bounding box: everything lives inside this
 uniform vec3 uStage;  // floor fade: centre x, centre z, radius
 uniform vec4 uCut;    // cutaway plane: normal, offset. Space beyond it is removed.
-uniform float uHQ,uPick,uMinEps;
+uniform float uHQ,uPick,uMinEps,uHideBodies;
 out vec4 fragColor;
 ${SDF_LIBRARY}
-${sceneCode}
+// No body is closer than this to a point inside the stage. Refreshed every frame.
+uniform highp sampler3D uBodyBounds;
+uniform vec3 uBoundsLo,uBoundsSize;
+float bodyLowerBound(vec3 p){
+  vec3 uvw=(p-uBoundsLo)/uBoundsSize;
+  if(any(lessThan(uvw,vec3(0)))||any(greaterThanEqual(uvw,vec3(1))))return 0.;
+  return texelFetch(uBodyBounds,ivec3(uvw*vec3(textureSize(uBodyBounds,0))),0).r;
+}
 ${EDIT_GLSL}
+${sceneCode}
 float cutPlane(vec3 p){return dot(uCut.xyz,p)-uCut.w;}
-float exactModel(vec3 p){return applyEdits(treeMap(p),p);}
+float exactModel(vec3 p){return ${editsInTree ? 'treeMap(p)' : 'applyEdits(treeMap(p),p)'};}
 ${baked ? `
 // Baked: distance comes from the cached grid. Outside the grid, add the distance
 // to its edge. Material still comes from the tree, once per hit, so painted
@@ -85,7 +93,7 @@ float modelMap(vec3 p){return exactModel(p);}`}
 // A cutaway is one operation on the distance, so it needs no rebaking.
 float map(vec3 p){return max(modelMap(p),cutPlane(p));}
 float exactMap(vec3 p){return max(exactModel(p),cutPlane(p));}
-Hit mapFull(vec3 p){return applyEditsHit(treeHit(p),p);}
+Hit mapFull(vec3 p){return ${editsInTree ? 'treeHit(p)' : 'applyEditsHit(treeHit(p),p)'};}
 
 const vec3 KEY=normalize(vec3(.55,.8,.35));
 const vec3 FLOOR=vec3(.03,.032,.037);
@@ -379,7 +387,20 @@ class Viewer {
   }
 
   setScene(scene) {
-    const compiled = SDF.compile(scene.build());
+    // A physics scene is a fixed world plus bodies, which the simulation moves.
+    this.sim = null;
+    this.bodyGrab = null;
+    let tree;
+    if (scene.physics) {
+      const spec = scene.physics();
+      this.sim = new PhysicsWorld({ world: spec.world.d });
+      for (const { shape, ...options } of spec.bodies) this.sim.add(shape, options);
+      tree = SDF.withBodies(spec.world, this.sim.bodies.map((b) => ({ shape: b.shape, radius: b.info.renderRadius })));
+    } else {
+      tree = scene.build();
+    }
+    this.toolScale = scene.toolScale || 1;
+    const compiled = SDF.compile(tree);
     this.sceneCode = compiled.code;
     this.animation = scene.animate ? scene : null;
     this.clock = 0;
@@ -387,7 +408,9 @@ class Viewer {
     this.jointR = new Float32Array(compiled.joints.length * 9);
     this.jointT = new Float32Array(compiled.joints.length * 3);
     this.cut = null;
-    const program = this.link(FRAGMENT_SHADER(this.sceneCode, false));
+    const program = this.link(FRAGMENT_SHADER(this.sceneCode, false, !!this.sim));
+    this.gl.useProgram(program.prog);
+    this.gl.uniform1i(program.uniforms.uBodyBounds, 2);
     if (this.live) this.gl.deleteProgram(this.live.prog);
     this.live = program;
     this.disposeField();
@@ -403,6 +426,7 @@ class Viewer {
     // Rays march inside this box. An animated scene moves it along with the model.
     this.rayBox = { center: scene.center, extent: scene.movingExtent || scene.extent };
     this.applyPose();
+    this.applySimulation();
     this.cut = { axis: scene.cutAxis || 'z', amount: 0, flip: false };
     this.updateCutPlane();
     this.home = { ...scene.camera, target: scene.center };
@@ -419,11 +443,12 @@ class Viewer {
 
   // ---- renderer modes ---------------------------------------------------------
 
-  get usingField() { return !this.animation && this.mode === 'baked' && !!this.field && this.field.ready; }
+  get liveOnly() { return !!(this.animation || this.sim); }
+  get usingField() { return !this.liveOnly && this.mode === 'baked' && !!this.field && this.field.ready; }
   get active() { return this.usingField ? this.baked : this.live; }
 
   setMode(mode) {
-    if (this.animation || (mode === 'baked' && !this.floatTarget)) return;
+    if (this.liveOnly || (mode === 'baked' && !this.floatTarget)) return;
     this.mode = mode;
     this.restart(this.moving);
     this.onChange();
@@ -469,6 +494,72 @@ class Viewer {
     if (this.cut) this.updateCutPlane();
   }
 
+  // Hands the simulation's transforms to the shader's joints.
+  applySimulation() {
+    if (!this.sim) return;
+    this.sim.bodies.forEach((b, i) => {
+      // Rows of R, as GLSL columns, give the inverse that shape-space needs.
+      this.jointR.set(b.R, i * 9);
+      this.jointT.set(b.renderTranslation(), i * 3);
+    });
+    this.updateBodyBounds();
+  }
+
+  // A coarse grid over the stage. Each cell holds a lower bound on the distance
+  // to any body, or BOUND_FAR when none is within reach. Rays read this first.
+  updateBodyBounds() {
+    const gl = this.gl;
+    const { center, extent } = this.bound;
+    const dims = [40, 20, 40];
+    if (!this.boundsTex) {
+      this.boundsTex = gl.createTexture();
+      gl.activeTexture(gl.TEXTURE2);
+      gl.bindTexture(gl.TEXTURE_3D, this.boundsTex);
+      gl.texStorage3D(gl.TEXTURE_3D, 1, gl.R32F, ...dims);
+      gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.activeTexture(gl.TEXTURE0);
+      this.boundsData = new Float32Array(dims[0] * dims[1] * dims[2]);
+    }
+    const FAR = 1.2;
+    const lo = center.map((c, i) => c - extent[i]);
+    const size = extent.map((e) => e * 2);
+    const cell = size.map((s, i) => s / dims[i]);
+    const slack = Math.hypot(...cell) / 2;
+    const data = this.boundsData;
+    data.fill(FAR);
+    for (const b of this.sim.bodies) {
+      const t = b.renderTranslation();
+      const r = b.info.renderRadius;
+      const reach = FAR + r + slack;
+      const from = t.map((v, i) => Math.max(0, Math.floor((v - reach - lo[i]) / cell[i])));
+      const to = t.map((v, i) => Math.min(dims[i] - 1, Math.floor((v + reach - lo[i]) / cell[i])));
+      for (let k = from[2]; k <= to[2]; k++) {
+        const z = lo[2] + (k + 0.5) * cell[2] - t[2];
+        for (let j = from[1]; j <= to[1]; j++) {
+          const y = lo[1] + (j + 0.5) * cell[1] - t[1];
+          const row = (k * dims[1] + j) * dims[0];
+          for (let i = from[0]; i <= to[0]; i++) {
+            const x = lo[0] + (i + 0.5) * cell[0] - t[0];
+            const d = Math.sqrt(x * x + y * y + z * z) - r - slack;
+            if (d < data[row + i]) data[row + i] = d;
+          }
+        }
+      }
+    }
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_3D, this.boundsTex);
+    gl.texSubImage3D(gl.TEXTURE_3D, 0, 0, 0, 0, ...dims, gl.RED, gl.FLOAT, data);
+    gl.activeTexture(gl.TEXTURE0);
+  }
+
+  dropAgain() {
+    if (!this.sim) return;
+    this.sim.reset();
+    this.applySimulation();
+    this.restart(true);
+  }
+
   setPaused(paused) {
     this.paused = paused;
     this.onChange();
@@ -476,7 +567,7 @@ class Viewer {
 
   // Bakes a little each frame, then keeps the world texture in step with edits.
   stepField() {
-    if (this.animation) return;
+    if (this.liveOnly) return;
     if (this.mode === 'baked' && !this.field && this.sample >= 1) this.startBake();
     const field = this.field;
     if (!field) return;
@@ -528,6 +619,7 @@ class Viewer {
     this.dirty = unionBounds(this.dirty, region);
     this.editPack = packEdits(this.edits);
     this.activeUntil = performance.now() + 150;
+    if (this.sim) this.sim.setEdits(this.edits);
     this.onChange();
   }
 
@@ -545,7 +637,7 @@ class Viewer {
     }
     const { paint, ...shape } = TOOLS[tool];
     const look = SDF.material(...(paint || ['#808080']));
-    const edit = { ...shape, size: [...shape.size], pos: [...pos], ...look };
+    const edit = { ...shape, size: shape.size.map((s) => s * this.toolScale), pos: [...pos], ...look };
     this.edits.push(edit);
     this.changed(editBounds(edit));
     return edit;
@@ -588,8 +680,9 @@ class Viewer {
   }
 
   // Asks the GPU where the pointer's ray hits the model.
-  pickSurface(x, y) {
+  pickSurface(x, y, includeBodies = false) {
     if (!this.pickFbo) return null;
+    this.pickBodies = includeBodies;
     const gl = this.gl;
     const { width, height, clientWidth, clientHeight } = this.canvas;
     const px = (x * width) / clientWidth;
@@ -643,6 +736,11 @@ class Viewer {
 
   describe() {
     const f = this.field;
+    if (this.sim) {
+      const { bodies, stats } = this.sim;
+      const asleep = bodies.length - this.sim.awakeCount;
+      return `${bodies.length} bodies, ${asleep} asleep · physics ${stats.stepMs.toFixed(1)} ms/step, ${stats.contacts} contacts · ${(this.previewScale * 100).toFixed(0)}% resolution · ${this.frameMs.toFixed(0)} ms/frame`;
+    }
     if (this.animation) {
       return this.paused
         ? 'Paused · refining to full quality'
@@ -708,7 +806,17 @@ class Viewer {
         }
       } else {
         const edit = this.editAt(e.clientX, e.clientY);
-        if (edit) this.grabEdit(edit, e.clientX, e.clientY);
+        if (edit) {
+          this.grabEdit(edit, e.clientX, e.clientY);
+        } else if (this.sim) {
+          // Pick a body up. It is pulled towards the pointer by a spring.
+          const hit = this.pickSurface(e.clientX, e.clientY, true);
+          const body = hit && this.sim.bodyAt(...hit);
+          if (body) {
+            this.bodyGrab = { point: hit };
+            this.sim.grabBody(body, hit);
+          }
+        }
       }
     });
     c.addEventListener('pointermove', (e) => {
@@ -722,7 +830,10 @@ class Viewer {
       const dy = e.clientY - last[1];
       last[0] = e.clientX;
       last[1] = e.clientY;
-      if (this.grab && pointers.size === 1) {
+      if (this.bodyGrab && pointers.size === 1) {
+        this.bodyGrab.point = this.onDragPlane(e.clientX, e.clientY, this.bodyGrab.point);
+        this.sim.moveGrab(this.bodyGrab.point);
+      } else if (this.grab && pointers.size === 1) {
         this.dragEdit(e.clientX, e.clientY);
       } else if (pointers.size === 2) {
         const [a, b] = [...pointers.values()];
@@ -740,6 +851,8 @@ class Viewer {
       pointers.delete(e.pointerId);
       pinch = 0;
       this.grab = null;
+      if (this.bodyGrab) this.sim.releaseGrab();
+      this.bodyGrab = null;
       if (!pointers.size) c.classList.remove('dragging');
     };
     c.addEventListener('pointerup', release);
@@ -812,6 +925,7 @@ class Viewer {
     gl.uniform1f(u.uMinEps, Math.max(0.0006, voxel));
     gl.uniform1f(u.uCutDepth, Math.max(0.012, voxel * 1.5));
     gl.uniform1f(u.uPick, pick ? 1 : 0);
+    gl.uniform1f(u.uHideBodies, pick && !this.pickBodies ? 1 : 0);
     gl.uniform4fv(u.uCut, this.cutPlane);
     // Picking looks at the unedited model, so a hole can glide along the surface
     // without falling into itself.
@@ -829,6 +943,8 @@ class Viewer {
     gl.uniform3fv(u.uCenter, this.rayBox.center);
     gl.uniform3fv(u.uExtent, this.rayBox.extent);
     gl.uniform3f(u.uStage, this.bound.center[0], this.bound.center[2], this.bound.radius);
+    gl.uniform3f(u.uBoundsLo, ...this.bound.center.map((c, i) => c - this.bound.extent[i]));
+    gl.uniform3fv(u.uBoundsSize, this.bound.extent.map((e) => e * 2));
     if (this.jointIndex.size) {
       gl.uniformMatrix3fv(u['uJointR[0]'], false, this.jointR);
       gl.uniform3fv(u['uJointT[0]'], this.jointT);
@@ -863,7 +979,12 @@ class Viewer {
       this.clock += Math.min(dt, 100) / 1000;
       this.applyPose();
     }
-    if (this.ease() || animating || now < (this.activeUntil || 0)) this.restart(true);
+    const simulating = this.sim && !this.paused && this.sim.awakeCount > 0;
+    if (simulating) {
+      this.sim.advance(Math.min(dt, 50) / 1000);
+      this.applySimulation();
+    }
+    if (this.ease() || animating || simulating || now < (this.activeUntil || 0)) this.restart(true);
     else if (this.moving) this.restart(false);
     if (this.moving) this.frameMs += (dt - this.frameMs) * 0.1;
     if (now - (this.lastStatus || 0) > 250) { this.lastStatus = now; this.onChange(); }

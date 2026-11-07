@@ -54,13 +54,14 @@ window.TW = (() => {
       });
     },
     // Held in the air and moved smoothly, then stopped.
+    // High enough that even a long beam, hanging from its end, cannot reach the floor.
     air(name, { rate = 1 } = {}) {
-      const w = new PhysicsWorld(); const b = w.add(shapes[name], { at: [1, 2, 0], rotate: restRot[name] });
-      const g = grabPoint(b); w.grabBody(b, g); const off = g.map((v, i) => v - [1, 2, 0][i]);
+      const w = new PhysicsWorld(); const b = w.add(shapes[name], { at: [1, 3.5, 0], rotate: restRot[name] });
+      const g = grabPoint(b); w.grabBody(b, g); const off = g.map((v, i) => v - [1, 3.5, 0][i]);
       for (let f = 0; f < 90; f++) w.step(1 / 60);
       const t = tracker(b); let err = 0, n = 0; const R = 1, speed = 1.2;
       for (let f = 0; f < 240; f++) {
-        const a = (f / 60) * speed / R; const tgt = [R * Math.cos(a) + off[0], 2 + off[1], R * Math.sin(a) + off[2]];
+        const a = (f / 60) * speed / R; const tgt = [R * Math.cos(a) + off[0], 3.5 + off[1], R * Math.sin(a) + off[2]];
         if (f % rate === 0) w.moveGrab(tgt);
         w.step(1 / 60); t.sample();
         const r = mulMat3(b.R, w.grab.local); const e = Math.hypot(b.x[0] + r[0] - tgt[0], b.x[1] + r[1] - tgt[1], b.x[2] + r[2] - tgt[2]); err += e; n++;

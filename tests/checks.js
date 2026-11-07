@@ -146,6 +146,21 @@ window.runChecks = () => {
     check('calm', `${n} pressed against a wall, spin`, wl.peakSpin, wl.peakSpin < 25, '< 25');
   }
   check('calm', 'ring pulled along floor stays down (hop)', S.floor('ring').hop, S.floor('ring').hop < 0.05, '< 0.05');
+  {
+    // Known and open: a beam held by one end with its other end on the floor, like a
+    // ladder, keeps wobbling. A cube held the same way is still.
+    const lean = (shape, local, height) => {
+      const w = new PhysicsWorld(); const b = w.add(shape, { at: [1, height, 0] });
+      w.grabBody(b, b.x.map((v, i) => v + local[i]));
+      for (let f = 0; f < 300; f++) w.step(1 / 60);
+      let sum = 0; for (let f = 0; f < 600; f++) { w.step(1 / 60); sum += b.pointSpeed ** 2; }
+      return +Math.sqrt(sum / 600).toFixed(3);
+    };
+    const cube = lean(box(0.44, 0.44, 0.44).round(0.04), [0.25, 0.25, 0], 0.4);
+    check('calm', 'cube held leaning on its edge, wobble', cube, cube < 0.05, '< 0.05');
+    const beam = lean(box(0.14, 0.14, 2.6), [0, 0.07, 1.25], 2);
+    results.push({ group: 'calm', name: 'beam held leaning on the floor, wobble', value: beam, pass: beam < 0.05, want: '< 0.05', open: true });
+  }
   const hk = S.hooked();
   check('calm', 'hooked ring stays threaded', hk.stillThreaded, hk.stillThreaded, 'true');
   check('calm', 'hooked ring, jitter', hk.jitterRms, hk.jitterRms < 40, '< 40');

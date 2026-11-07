@@ -25,6 +25,7 @@ const PHYSICS = {
   searchEvery: 3,      // substeps between full contact searches
   fastSpeed: 10,       // a body this fast is searched for on every substep
   margin: 0.012,       // how close a sample must be before it is refined
+  thinSpacing: 1.4,    // more samples once they are this many half-thicknesses apart
   friction: 0.6,
   restitution: 0.2,
   rollingResistance: 0.012, // a torque, as a length: how far the load sits off-centre
@@ -126,7 +127,10 @@ const makeRandom = (seed) => () => {
 const analysisCache = new WeakMap();
 
 // Everything physics needs to know about a shape, measured from its SDF alone.
-const analyseShape = (shape, sampleCount = 32) => {
+// Samples are spread over the surface, so a thin, curved part such as a ring's tube
+// can fall between them. When the gap between samples is large compared with how
+// thick the shape is, it gets twice as many.
+const analyseShape = (shape, sampleCount = null) => {
   if (analysisCache.has(shape)) return analysisCache.get(shape);
   const d = shape.d;
   const random = makeRandom(12345);
@@ -180,13 +184,16 @@ const analyseShape = (shape, sampleCount = 32) => {
   const com = [0, 0, 0];
   const inside = [];
   let volume = 0;
+  let deepest = 0; // the deepest interior distance is half the shape's thickness
   for (let i = -1; i <= cells; i++) {
     for (let j = -1; j <= cells; j++) {
       for (let k = -1; k <= cells; k++) {
         const x = bx[0] + (i + 0.5) * cx;
         const y = by[0] + (j + 0.5) * cy;
         const z = bz[0] + (k + 0.5) * cz;
-        const fill = Math.max(0, Math.min(1, 0.5 - d(x, y, z) / blur));
+        const dist = d(x, y, z);
+        if (dist < deepest) deepest = dist;
+        const fill = Math.max(0, Math.min(1, 0.5 - dist / blur));
         if (fill <= 0) continue;
         inside.push([x, y, z, fill]);
         volume += fill;
@@ -228,7 +235,10 @@ const analyseShape = (shape, sampleCount = 32) => {
   const chosen = [];
   let spacing = Math.hypot(bx[1] - bx[0], by[1] - by[0], bz[1] - bz[0]);
   nearest.fill(Infinity);
-  for (let n = 0; n < sampleCount && candidates.length; n++) {
+  const halfThickness = -deepest;
+  const most = sampleCount || 64;
+  const spacings = [];
+  for (let n = 0; n < most && candidates.length; n++) {
     const pick = candidates[next];
     chosen.push(pick);
     let best = -1;
@@ -239,14 +249,19 @@ const analyseShape = (shape, sampleCount = 32) => {
       if (nearest[i] > best) { best = nearest[i]; bestIndex = i; }
     }
     spacing = best;
+    spacings.push(best);
     next = bestIndex;
   }
+  let count = sampleCount || 32;
+  if (!sampleCount && spacings[31] > PHYSICS.thinSpacing * halfThickness) count = 64;
+  chosen.length = Math.min(chosen.length, count);
+  spacing = spacings[Math.min(count, spacings.length) - 1];
   const points = chosen.map((p) => [p[0] - com[0], p[1] - com[1], p[2] - com[2]]);
   const radius = Math.max(...candidates.map((p) => Math.hypot(p[0] - com[0], p[1] - com[1], p[2] - com[2])));
   const renderRadius = Math.max(...candidates.map((p) => Math.hypot(p[0], p[1], p[2])));
 
   const result = {
-    d, volume: volume * unit, com, inertia, invInertia: invertMat3(inertia), points, spacing, radius, renderRadius,
+    d, volume: volume * unit, com, inertia, halfThickness, invInertia: invertMat3(inertia), points, spacing, radius, renderRadius,
   };
   analysisCache.set(shape, result);
   return result;

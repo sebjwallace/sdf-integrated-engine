@@ -35,6 +35,13 @@ const PHYSICS = {
   sleepSpeed: 0.12,
   sleepAfter: 0.6,
   stepsPerSecond: 60,
+  grab: {
+    stiffness: 0.12,   // fraction of the gap to the pointer closed per substep
+    maxForce: 8,       // strongest pull, in multiples of the body's weight in normal gravity
+    damping: 3,        // per second, while held
+    spinDamping: 6,    // per second, while held
+    smoothing: 0.35,   // fraction of the way to the pointer the target moves per step
+  },
 };
 
 // Gradient of a distance function, by tetrahedral differences.
@@ -347,6 +354,8 @@ class RigidBody {
   prepare() {
     this.dx = [0, 0, 0];
     this.dth = [0, 0, 0];
+    this.repairDx = [0, 0, 0];
+    this.repairDth = [0, 0, 0];
     if (this.sleeping) {
       this.im = 0;
       this.invI = [0, 0, 0, 0, 0, 0, 0, 0, 0];
@@ -383,6 +392,19 @@ class RigidBody {
     this.dth[2] += t[2];
   }
 
+  // The same movement, but only tidying up an overlap. It changes where the body
+  // is, and must not count towards how fast it is going.
+  applyRepair(r, p, sign) {
+    const P = [p[0] * sign, p[1] * sign, p[2] * sign];
+    const t = mulMat3(this.invI, cross3(r, P));
+    for (let i = 0; i < 3; i++) {
+      this.dx[i] += P[i] * this.im;
+      this.dth[i] += t[i];
+      this.repairDx[i] += P[i] * this.im;
+      this.repairDth[i] += t[i];
+    }
+  }
+
   // Movement of a point at r so far during this substep's solve.
   pushed(r) {
     const t = cross3(this.dth, r);
@@ -391,6 +413,14 @@ class RigidBody {
 
   // The fastest any point on the body can be moving.
   get pointSpeed() { return Math.hypot(...this.v) + Math.hypot(...this.w) * this.info.radius; }
+
+  // Like pushed(), without the repairs: the movement that counts as real motion.
+  movedForReal(r) {
+    const t = cross3([
+      this.dth[0] - this.repairDth[0], this.dth[1] - this.repairDth[1], this.dth[2] - this.repairDth[2],
+    ], r);
+    return [this.dx[0] - this.repairDx[0] + t[0], this.dx[1] - this.repairDx[1] + t[1], this.dx[2] - this.repairDx[2] + t[2]];
+  }
 
   velocityAt(r) {
     const t = cross3(this.w, r);
@@ -494,12 +524,12 @@ class PhysicsWorld {
   grabBody(body, point) {
     const r = [point[0] - body.x[0], point[1] - body.x[1], point[2] - body.x[2]];
     this.wake(body);
-    this.grab = { body, local: mulMat3T(body.R, r), target: [...point] };
+    this.grab = { body, local: mulMat3T(body.R, r), target: [...point], goal: [...point] };
   }
 
   moveGrab(target) {
     if (!this.grab) return;
-    this.grab.target = target;
+    this.grab.goal = target;
     this.wake(this.grab.body);
   }
 
@@ -522,6 +552,11 @@ class PhysicsWorld {
   step(dt) {
     const h = dt / this.substeps;
     this.stats.contacts = 0;
+    if (this.grab) {
+      // Pointers move in jumps. Ease towards them, so a jump is not a kick.
+      const { target, goal } = this.grab;
+      for (let i = 0; i < 3; i++) target[i] += (goal[i] - target[i]) * PHYSICS.grab.smoothing;
+    }
     for (let i = 0; i < this.substeps; i++) {
       const fast = this.bodies.some((b) => !b.sleeping && b.pointSpeed > PHYSICS.fastSpeed);
       this.substep(h, fast || i % PHYSICS.searchEvery === 0);
@@ -557,7 +592,16 @@ class PhysicsWorld {
       }
       this.manifolds = contacts;
     } else {
-      contacts = this.manifolds = this.refreshContacts(this.manifolds);
+      // Whatever is being dragged moves unpredictably, so it is always searched.
+      const held = this.grab && !this.grab.body.sleeping ? this.grab.body : null;
+      const others = held ? this.manifolds.filter((m) => m.A !== held && m.B !== held) : this.manifolds;
+      contacts = this.refreshContacts(others);
+      if (held) {
+        contacts.push(...this.findContacts(h, held));
+        held.xSearch = held.x;
+        held.RSearch = held.R;
+      }
+      this.manifolds = contacts;
     }
     this.stats.contacts = Math.max(this.stats.contacts, contacts.reduce((n, m) => n + m.contacts.length, 0));
 
@@ -579,26 +623,42 @@ class PhysicsWorld {
       b.R = matFromQuat(b.q);
 
       // Velocity is whatever motion the positions ended up describing.
-      b.v = [(b.x[0] - b.xPrev[0]) / h, (b.x[1] - b.xPrev[1]) / h, (b.x[2] - b.xPrev[2]) / h];
+      // Except for repairs: speed that came from tidying an overlap would be energy
+      // from nowhere, and would feed the next collision.
+      b.v = [
+        (b.x[0] - b.xPrev[0] - b.repairDx[0]) / h,
+        (b.x[1] - b.xPrev[1] - b.repairDx[1]) / h,
+        (b.x[2] - b.xPrev[2] - b.repairDx[2]) / h,
+      ];
       const [px, py, pz, pw] = b.qPrev;
       const [x, y, z, w] = b.q;
       const rw = w * pw + x * px + y * py + z * pz;
       const sign = (rw < 0 ? -2 : 2) / h;
       b.w = [
-        sign * (x * pw - w * px - y * pz + z * py),
-        sign * (y * pw - w * py - z * px + x * pz),
-        sign * (z * pw - w * pz - x * py + y * px),
+        sign * (x * pw - w * px - y * pz + z * py) - b.repairDth[0] / h,
+        sign * (y * pw - w * py - z * px + x * pz) - b.repairDth[1] / h,
+        sign * (z * pw - w * pz - x * py + y * px) - b.repairDth[2] / h,
       ];
     }
     for (const m of contacts) this.solveVelocity(m, h);
+
+    // Velocity is rebuilt from positions above, so damping has to come after it.
+    if (this.grab && !this.grab.body.sleeping) {
+      const { body } = this.grab;
+      const slow = Math.exp(-PHYSICS.grab.damping * h);
+      const slowSpin = Math.exp(-PHYSICS.grab.spinDamping * h);
+      body.v = body.v.map((c) => c * slow);
+      body.w = body.w.map((c) => c * slowSpin);
+    }
   }
 
-  findContacts(h) {
+  // Every awake body, or only the pairs involving `only`.
+  findContacts(h, only = null) {
     const { bodies } = this;
     const contacts = [];
-    const horizon = h * PHYSICS.searchEvery;
+    const horizon = only ? h : h * PHYSICS.searchEvery;
     for (const b of bodies) {
-      if (b.sleeping) continue;
+      if (b.sleeping || (only && b !== only)) continue;
       // The world's distance at the centre tells us if the whole body is clear.
       if (this.worldDist(b.x[0], b.x[1], b.x[2]) < b.info.radius + PHYSICS.margin + b.pointSpeed * horizon) {
         const seeds = this.collide(b, null, this.worldDist, contacts, horizon);
@@ -609,7 +669,7 @@ class PhysicsWorld {
       for (let j = i + 1; j < bodies.length; j++) {
         const a = bodies[i];
         const b = bodies[j];
-        if (a.sleeping && b.sleeping) continue;
+        if ((a.sleeping && b.sleeping) || (only && a !== only && b !== only)) continue;
         const reach = a.info.radius + b.info.radius + PHYSICS.margin;
         const dx = a.x[0] - b.x[0];
         const dy = a.x[1] - b.x[1];
@@ -794,44 +854,60 @@ class PhysicsWorld {
   }
 
   // Samples can miss an overlap between thin bodies entirely. This asks the
-  // distance functions directly, from a few places likely to find it.
+  // distance functions directly, from a few places likely to find it. Concave
+  // bodies, such as two linked rings, can overlap in several separate places, so
+  // every distinct overlap found becomes its own contact.
   collideOverlap(A, B, field, seeds, contacts) {
     const key = B ? `${A.id}:${B.id}` : `${A.id}`;
-    const starts = [...seeds];
-    const known = this.overlapMemory.get(key);
-    if (known) {
+    const memory = this.overlapMemory.get(key) || [];
+    const starts = memory.map((known) => {
       const r = mulMat3(A.R, known);
-      starts.unshift([A.x[0] + r[0], A.x[1] + r[1], A.x[2] + r[2]]);
-    }
+      return [A.x[0] + r[0], A.x[1] + r[1], A.x[2] + r[2]];
+    });
     starts.push(B
       ? [(A.x[0] + B.x[0]) / 2, (A.x[1] + B.x[1]) / 2, (A.x[2] + B.x[2]) / 2]
       : [...A.x]);
+    starts.push(...seeds);
 
-    let best = null;
+    const apart = Math.min(A.info.spacing, B ? B.info.spacing : Infinity) * 0.5;
+    const hits = [];
+    let misses = 0;
     for (const s of starts) {
+      // Most pairs are not touching at all, so do not keep looking for long.
+      if (!hits.length && misses >= 2) break;
       const hit = deepestOverlap(A.dist, field, s[0], s[1], s[2]);
-      if (hit && (!best || hit.deepest > best.deepest)) best = hit;
-      if (best) break; // convex pairs agree, and the first answer costs the least
+      if (!hit) {
+        misses++;
+        continue;
+      }
+      const same = hits.find((h) => Math.hypot(h.x - hit.x, h.y - hit.y, h.z - hit.z) < apart);
+      if (!same) hits.push(hit);
+      else if (hit.deepest > same.deepest) Object.assign(same, hit);
     }
-    if (!best) {
+    if (!hits.length) {
       this.overlapMemory.delete(key);
       return;
     }
-    const r = [best.x - A.x[0], best.y - A.x[1], best.z - A.x[2]];
-    this.overlapMemory.set(key, mulMat3T(A.R, r));
+    this.overlapMemory.set(key, hits.map((h) => mulMat3T(A.R, [h.x - A.x[0], h.y - A.x[1], h.z - A.x[2]])));
 
-    const contact = this.overlapContact(A, B, field, best);
-    if (!contact) return;
-    // This contact exists to catch what the samples miss. If they already reach
-    // about as deep, they are holding this pair, and more load would only distort
-    // friction.
-    let sampled = 0;
+    // These contacts exist to catch what the samples miss. A sample already holding
+    // the same spot about as deeply has it covered, and more load there would only
+    // distort friction.
+    const sampled = [];
     for (const m of contacts) {
       if (!((m.A === A && m.B === B) || (m.A === B && m.B === A))) continue;
-      for (const c of m.contacts) sampled = Math.max(sampled, c.depth);
+      for (const c of m.contacts) sampled.push({ x: c.rA[0] + m.A.x[0], y: c.rA[1] + m.A.x[1], z: c.rA[2] + m.A.x[2], depth: c.depth });
     }
-    if (contact.depth <= sampled * 1.25 + PHYSICS.slop) return;
-    contacts.push({ A, B, field, overlap: true, contacts: [contact] });
+    for (const hit of hits) {
+      const contact = this.overlapContact(A, B, field, hit);
+      if (!contact) continue;
+      // Faces resting on each other have a whole plateau of near-equal points. Those
+      // are not separate overlaps, and samples are already holding them up.
+      if (sampled.length && contact.depth <= Math.max(...sampled.map((c) => c.depth)) * 1.25 + PHYSICS.slop) continue;
+      const covered = sampled.some((c) => Math.hypot(c.x - hit.x, c.y - hit.y, c.z - hit.z) < apart * 1.5
+        && contact.depth <= c.depth * 1.25 + PHYSICS.slop);
+      if (!covered) contacts.push({ A, B, field, overlap: true, contacts: [contact] });
+    }
   }
 
   overlapContact(A, B, field, hit) {
@@ -885,6 +961,9 @@ class PhysicsWorld {
     return [body.xPrev[0] + rp[0] - body.x[0], body.xPrev[1] + rp[1] - body.x[1], body.xPrev[2] + rp[2] - body.x[2]];
   }
 
+  // A pull like a hand's: it has a strongest force, in proportion to the body's
+  // weight. Pressed against something, it presses. It cannot overpower the contact
+  // and send the body spinning.
   solveGrab(h) {
     if (!this.grab) return;
     const { body, local, target } = this.grab;
@@ -894,12 +973,9 @@ class PhysicsWorld {
     const len = Math.hypot(...e);
     if (len < 1e-5) return;
     const n = [e[0] / len, e[1] / len, e[2] / len];
-    // A soft spring, limited so a fast pointer cannot fling a body through walls.
-    const move = Math.min(len * 0.12, 18 * h);
-    const lambda = move / body.resistance(r, n);
+    const { stiffness, maxForce } = PHYSICS.grab;
+    const lambda = Math.min((len * stiffness) / body.resistance(r, n), maxForce * body.mass * PHYSICS.gravity * h * h);
     body.applyPush(r, [n[0] * lambda, n[1] * lambda, n[2] * lambda], 1);
-    body.v = body.v.map((c) => c * 0.985);
-    body.w = body.w.map((c) => c * 0.97);
   }
 
   solveNormal(c, h, share) {
@@ -912,26 +988,51 @@ class PhysicsWorld {
       moved[2] -= mb[2];
     }
     // Deep overlaps separate gradually. Swept hits must stop now.
+    // A contact always stops the approach, however shallow it is, or a resting body
+    // would sink, get caught and bounce forever. The allowance only decides whether
+    // existing overlap is worth repairing.
+    const closing = Math.max(-c.vnBefore * h, 0);
     let allowed;
     if (c.swept) {
       allowed = c.depth;
     } else if (c.soft) {
-      // A single point on a long body is a lever, so a hard push can fling it.
-      // Stop the approach exactly, then ease out of what is left.
-      const approach = Math.max(-c.vnBefore * h, 0);
-      allowed = Math.min(approach + Math.max(c.depth - PHYSICS.slop - approach, 0) * 0.2, PHYSICS.softPushSpeed * h);
+      // A single point on a long body is a lever, so ease out of what is left.
+      allowed = closing + Math.min(Math.max(c.depth - PHYSICS.slop - closing, 0) * 0.2, PHYSICS.softPushSpeed * h);
     } else {
-      allowed = Math.min(Math.max(c.depth - PHYSICS.slop, 0), PHYSICS.maxPushSpeed * h);
+      allowed = Math.max(closing, Math.min(c.depth - PHYSICS.slop, PHYSICS.maxPushSpeed * h));
     }
     const remaining = allowed - dot3(moved, n);
     if (remaining <= 0) return;
     const wn = A.resistance(rA, n) + (B ? B.resistance(rB, n) : 0);
     if (wn <= 0) return;
-    const lambda = (remaining / wn) * share;
-    c.lambda += lambda;
-    const push = [n[0] * lambda, n[1] * lambda, n[2] * lambda];
-    A.applyPush(rA, push, 1);
-    if (B) B.applyPush(rB, push, -1);
+
+    // A push has two jobs. Stopping real motion into the contact is a real impulse:
+    // that is the bodies' own approach, plus anything neighbours have pressed them
+    // with, which is how load travels down a stack. Anything beyond that only removes
+    // overlap left from before, so it moves the body without giving it any speed.
+    const real = A.movedForReal(rA);
+    if (B) {
+      const rb = B.movedForReal(rB);
+      real[0] -= rb[0];
+      real[1] -= rb[1];
+      real[2] -= rb[2];
+    }
+    const approach = Math.max(closing - dot3(real, n), 0);
+    const stopping = Math.min(remaining, approach) * share;
+    const repairing = (remaining - Math.min(remaining, approach)) * share;
+    if (stopping > 0) {
+      const lambda = stopping / wn;
+      c.lambda += lambda;
+      const push = [n[0] * lambda, n[1] * lambda, n[2] * lambda];
+      A.applyPush(rA, push, 1);
+      if (B) B.applyPush(rB, push, -1);
+    }
+    if (repairing > 0) {
+      const lambda = repairing / wn;
+      const push = [n[0] * lambda, n[1] * lambda, n[2] * lambda];
+      A.applyRepair(rA, push, 1);
+      if (B) B.applyRepair(rB, push, -1);
+    }
   }
 
   // All contacts between two bodies act as one patch. Friction applied at the
@@ -987,12 +1088,13 @@ class PhysicsWorld {
     const patch = this.summarisePatch(m, h);
     if (!patch) return;
     const { A, B, rA, rB, n, total, friction } = patch;
+    // Repairs do not count as slip. Resisting one would turn it back into real speed.
     const prevA = this.previousOffset(A, rA);
-    const a = A.pushed(rA);
+    const a = A.movedForReal(rA);
     const slip = [a[0] + rA[0] - prevA[0], a[1] + rA[1] - prevA[1], a[2] + rA[2] - prevA[2]];
     if (B) {
       const prevB = this.previousOffset(B, rB);
-      const b = B.pushed(rB);
+      const b = B.movedForReal(rB);
       slip[0] -= b[0] + rB[0] - prevB[0];
       slip[1] -= b[1] + rB[1] - prevB[1];
       slip[2] -= b[2] + rB[2] - prevB[2];
@@ -1096,15 +1198,14 @@ class PhysicsWorld {
         b.still = 0;
       }
     }
-    // A moving body wakes anything it could be touching.
-    for (const a of bodies) {
-      if (a.sleeping) continue;
-      if (Math.hypot(...a.v) + Math.hypot(...a.w) * a.info.radius < 0.3) continue;
-      for (const b of bodies) {
-        if (!b.sleeping || a === b) continue;
-        const reach = a.info.radius + b.info.radius + 0.05;
-        if (Math.hypot(a.x[0] - b.x[0], a.x[1] - b.x[1], a.x[2] - b.x[2]) < reach) this.wake(b);
-      }
+    // A moving body wakes what it is actually touching. Waking everything within its
+    // bounding sphere let one tremor set off bodies across the scene, each of which
+    // set off more.
+    for (const m of this.manifolds) {
+      if (!m.B || m.A.sleeping === m.B.sleeping) continue;
+      const moving = m.A.sleeping ? m.B : m.A;
+      const resting = m.A.sleeping ? m.A : m.B;
+      if (moving.pointSpeed > 0.3) this.wake(resting);
     }
   }
 

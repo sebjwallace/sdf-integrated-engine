@@ -27,12 +27,19 @@
       <input id="quality" type="range" min="0" max="4" step="1" value="0" aria-describedby="quality-value">
       <output id="quality-value" for="quality">Auto</output>
     </div>
+    <div class="row" role="group" aria-label="Transform">
+      <span class="group-label">Transform</span>
+      <button data-gizmo="move" aria-pressed="true" title="Move the selected object (G)">Move</button>
+      <button data-gizmo="rotate" aria-pressed="false" title="Rotate the selected object (R)">Rotate</button>
+      <button data-gizmo="scale" aria-pressed="false" title="Scale the selected object (T)">Scale</button>
+      <span id="transform-note"></span>
+    </div>
     <div class="row" role="group" aria-label="Edit tools">
       <button data-tool="hole" aria-pressed="false">Add hole</button>
       <button data-tool="cut" aria-pressed="false">Add box cut</button>
       <button data-tool="blob" aria-pressed="false">Add blob</button>
       <button id="clear">Clear edits</button>
-      <button id="pause" hidden>Pause</button>
+      <button id="pause" hidden title="Play or pause (P)">Pause</button>
       <button id="drop" hidden>Drop again</button>
     </div>
     <div class="row" role="group" aria-label="Cutaway">
@@ -53,12 +60,13 @@
     <summary>Outliner</summary>
     <ul id="objects" aria-label="Objects in the scene"></ul>
   </details>
-  <p id="hint">Drag to rotate · Scroll to zoom · Shift-drag to pan · WASD to fly, Q/E down/up, Shift for speed · Move the pointer while flying, or hold Space, to look around · Double-click to reset · Click an object to select it, F frames it, H hides it<span id="edit-hints"> · Pick a tool, then press on the model · Drag an edit to move it · Scroll over it to resize · Delete removes it</span><span id="physics-hint" hidden> · Drag a body to throw it</span></p>
+  <p id="hint">Drag to rotate · Scroll to zoom · Shift-drag to pan · WASD to fly, Q/E down/up, Shift for speed · Move the pointer while flying, or hold Space, to look around · Double-click to reset · Click an object to select it, F frames it, H hides it · G, R and T move, rotate and scale it with the gizmo; Ctrl snaps, Esc cancels<span id="edit-hints"> · Pick a tool, then press on the model · Drag an edit to move it · Scroll over it to resize · Delete removes it</span><span id="physics-hint" hidden> · Drag a body to throw it</span></p>
   <p id="error" role="alert" hidden></p>
 
   <script src="sdf.js"></script>
   <script src="field.js"></script>
   <script src="physics.js"></script>
+  <script src="gizmo.js"></script>
   <script src="renderer.js"></script>
   <script src="scenes.js"></script>
   <script>
@@ -75,6 +83,8 @@
       const gridPicker = document.getElementById('grid');
       const stats = document.getElementById('stats');
       const toolButtons = [...document.querySelectorAll('[data-tool]')];
+      const gizmoButtons = [...document.querySelectorAll('[data-gizmo]')];
+      const transformNote = document.getElementById('transform-note');
       const clearButton = document.getElementById('clear');
       const cutSlider = document.getElementById('cut');
       const cutAxis = document.getElementById('cut-axis');
@@ -146,8 +156,12 @@
         pauseButton.hidden = !v.liveOnly;
         dropButton.hidden = !v.sim;
         document.getElementById('edit-hints').hidden = animated;
-        document.getElementById('physics-hint').hidden = !v.sim;
+        document.getElementById('physics-hint').hidden = !v.sim || v.paused;
         pauseButton.textContent = v.paused ? 'Play' : 'Pause';
+        for (const b of gizmoButtons) b.setAttribute('aria-pressed', b.dataset.gizmo === v.gizmo.mode);
+        // The gizmo waits while physics runs. Say why it is missing.
+        transformNote.textContent = v.sim && !v.paused ? 'Pause the simulation to move, rotate or scale'
+          : v.selected < 0 && v.gizmo.mode ? 'Select an object to transform it' : '';
         for (const b of toolButtons) {
           b.setAttribute('aria-pressed', b.dataset.tool === v.tool);
           b.disabled = animated;
@@ -181,6 +195,10 @@
       dropButton.addEventListener('click', () => viewer.dropAgain());
       for (const b of toolButtons) {
         b.addEventListener('click', () => viewer.setTool(viewer.tool === b.dataset.tool ? 'orbit' : b.dataset.tool));
+      }
+      // Pressing the active mode again hides the gizmo.
+      for (const b of gizmoButtons) {
+        b.addEventListener('click', () => viewer.setGizmo(viewer.gizmo.mode === b.dataset.gizmo ? null : b.dataset.gizmo));
       }
 
       for (const [key, scene] of Object.entries(SDF.scenes)) picker.add(new Option(scene.label, key));

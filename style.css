@@ -26,7 +26,10 @@ canvas {
   cursor: grab;
   touch-action: none;
 }
+canvas.over-gizmo { cursor: pointer; }
 canvas.dragging { cursor: grabbing; }
+/* The gizmo's layer: drawn over the view, but every pointer event goes through. */
+canvas.overlay { pointer-events: none; cursor: auto; }
 
 header {
   position: fixed;
@@ -86,6 +89,9 @@ output {
 }
 
 #quality-value { min-width: 4ch; }
+
+.group-label { color: var(--muted); }
+#transform-note { color: var(--muted); font-size: 12px; }
 
 #stats {
   margin: 0;

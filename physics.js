@@ -326,11 +326,8 @@ const deepestOverlap = (fa, fb, sx, sy, sz) => {
 
 class RigidBody {
   constructor(shape, { at = [0, 0, 0], rotate = [0, 0, 0], density = 1, friction, restitution, velocity = [0, 0, 0], spin = [0, 0, 0] } = {}) {
-    this.shape = shape;
-    this.info = analyseShape(shape);
-    this.mass = density * this.info.volume;
-    this.invMass = 1 / this.mass;
-    this.invInertiaLocal = this.info.invInertia.map((v) => v / density);
+    this.density = density;
+    this.measure(shape);
     this.friction = friction ?? PHYSICS.friction;
     this.restitution = restitution ?? PHYSICS.restitution;
     this.start = { at, rotate, velocity, spin };
@@ -348,6 +345,41 @@ class RigidBody {
       );
     };
     this.reset();
+  }
+
+  measure(shape) {
+    this.shape = shape;
+    this.info = analyseShape(shape);
+    this.mass = this.density * this.info.volume;
+    this.invMass = 1 / this.mass;
+    this.invInertiaLocal = this.info.invInertia.map((v) => v / this.density);
+  }
+
+  // Swaps in a new shape, such as this one stretched, keeping the centre of mass
+  // where it is in the world. The body stops, ready to be played again.
+  setShape(shape) {
+    const before = [...this.info.com];
+    this.measure(shape);
+    // Keep the shape's origin where it was, so the body does not jump.
+    const shift = mulMat3(this.R, this.info.com.map((v, i) => v - before[i]));
+    this.place(this.x.map((v, i) => v + shift[i]), this.q);
+  }
+
+  // Puts the body somewhere new, at rest, as an editor would.
+  place(x, q) {
+    this.q = normalizeQuat([...q]);
+    this.R = matFromQuat(this.q);
+    this.x = [...x];
+    this.v = [0, 0, 0];
+    this.w = [0, 0, 0];
+    this.xPrev = [...this.x];
+    this.qPrev = [...this.q];
+    this.RPrev = [...this.R];
+    this.xSearch = null;
+    this.RSearch = null;
+    this.sleeping = false;
+    this.still = 0;
+    this.prepare();
   }
 
   reset() {
@@ -523,6 +555,14 @@ class PhysicsWorld {
   }
 
   wakeAll() { for (const b of this.bodies) this.wake(b); }
+
+  // Something was moved by hand: old contacts no longer describe the scene.
+  forgetContacts() {
+    this.grab = null;
+    this.manifolds = [];
+    this.overlapMemory.clear();
+    this.wakeAll();
+  }
 
   // The ground changed, so anything resting on it may need to move.
   setEdits(edits) {

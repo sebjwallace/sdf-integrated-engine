@@ -8,7 +8,8 @@ A short orientation. For the model and the reasoning behind each part, read
 | File | What it does |
 |---|---|
 | `sdf.js` | The modelling language. Every shape compiles to GLSL for the GPU, and also has `shape.d(x, y, z)`, the same distance function in JavaScript for the CPU. |
-| `renderer.js` | Raymarches the scene in WebGL2. Handles the camera, picking, dragging, edits and the cutaway. |
+| `renderer.js` | Raymarches the scene in WebGL2. Handles the camera, picking, dragging, edits and the cutaway, and applies the gizmo's moves to objects and bodies. |
+| `gizmo.js` | The move, rotate and scale handles drawn over the selected object. Works only while the simulation is paused. |
 | `field.js` | Bakes a scene's distances into a 3D texture, and keeps live edits (holes, blobs) applied on top. |
 | `physics.js` | The rigid body engine. Everything below is in here. |
 | `scenes.js` | The scenes, including the physics playground and the `ANCHOR` shape. |
@@ -61,6 +62,10 @@ Things that matter and are easy to break:
   resting contacts in touch. Stacks depend on it.
 - **Sleeping bodies are immovable** inside the solver. They must be woken *before* a
   hit is solved (`wakeOnImpact`), or hits into them lose all their momentum.
+- **Moving bodies by hand happens while paused.** The gizmo calls `place()` (a new
+  pose, at rest), `setShape()` (a stretched shape, measured again), and then
+  `forgetContacts()`, since old contacts no longer describe the scene. Moving a world
+  part changes `worldDist` directly: named shapes read their transform from a `holder`.
 - **The pointer's pull is force-limited** (`PHYSICS.grab`), with damping applied after
   velocities are derived, so it cannot overpower contacts.
 

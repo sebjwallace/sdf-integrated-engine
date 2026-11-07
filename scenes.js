@@ -82,11 +82,13 @@ SDF.scenes.car = {
     // Dark wheel wells, so the cut-outs read as openings instead of red caves.
     const well = (x) => cylinder(0.385, 0.45).rotate(90).move(x, 0.32, 0.45).paint(trim);
 
-    // Everything is modelled once, on the +z side, and mirrored.
+    // Everything is modelled once, on the +z side, and mirrored. Each part is
+    // mirrored inside its name, so moving a part moves both of its sides together.
+    const part = (shape, name) => shape.mirror('z').named(name);
     return union(
-      body.named('Body'), union(well(1.36), well(-1.36)).named('Wheel wells'), cabin.paint(paintwork).named('Cabin'),
-      panes.named('Windows'), lamps.named('Lamps'), details.named('Trim'), wheels.named('Wheels'),
-    ).mirror('z');
+      part(body, 'Body'), part(union(well(1.36), well(-1.36)), 'Wheel wells'), part(cabin.paint(paintwork), 'Cabin'),
+      part(panes, 'Windows'), part(lamps, 'Lamps'), part(details, 'Trim'), part(wheels, 'Wheels'),
+    );
   },
 };
 

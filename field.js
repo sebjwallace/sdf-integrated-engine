@@ -1,7 +1,8 @@
 // field.js: caches a scene's distances in a 3D grid, then keeps a list of edits
 // applied on top of that cache.
 //
-//   base   the scene tree, baked once. Expensive to make, never changes.
+//   base   the scene tree, baked once. Expensive to make. When an object is
+//          moved by hand, only the region around it is baked again (rebake).
 //   world  base plus the edits. This is what the camera rays read.
 //
 // When an edit moves, only the voxels around it are rewritten, by reading base
@@ -136,12 +137,10 @@ void main(){
 }`);
     gl.useProgram(this.updateProgram.prog);
     gl.uniform1i(this.updateProgram.uniforms.uBase, 1);
-    // Hidden objects are left out of the bake.
-    const hidden = this.bakeProgram.uniforms['uHidden[0]'];
-    if (hidden) {
-      gl.useProgram(this.bakeProgram.prog);
-      gl.uniform1fv(hidden, viewer.hidden);
-    }
+    // Hidden objects are left out of the bake, and moved ones baked where they
+    // are now. The viewer sets both on every pass.
+    this.viewer = viewer;
+    this.region = null;
 
     this.layer = 0;
     this.baking = true;
@@ -184,22 +183,61 @@ void main(){
     const gl = this.gl;
     if (!this.bakeStart) this.bakeStart = performance.now();
     const u = this.beginPass(this.bakeProgram);
-    gl.disable(gl.SCISSOR_TEST);
+    this.viewer.setObjectUniforms(u);
+    const end = this.region ? this.region.b[2] : this.dims[2];
+    if (this.region) {
+      const { a, b } = this.region;
+      gl.enable(gl.SCISSOR_TEST);
+      gl.scissor(a[0], a[1], b[0] - a[0], b[1] - a[1]);
+    } else {
+      gl.disable(gl.SCISSOR_TEST);
+    }
     const start = performance.now();
-    while (this.layer < this.dims[2] && performance.now() - start < budgetMs) {
+    while (this.layer < end && performance.now() - start < budgetMs) {
       gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, this.base, 0, this.layer);
       gl.uniform1f(u.uLayer, this.layer);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
       gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.FLOAT, this.probe);
       this.layer++;
     }
-    if (this.layer >= this.dims[2]) {
+    gl.disable(gl.SCISSOR_TEST);
+    if (this.layer >= end) {
       this.baking = false;
-      this.bakeMs = performance.now() - this.bakeStart;
+      if (this.region) this.rebakeMs = performance.now() - this.bakeStart;
+      else this.bakeMs = performance.now() - this.bakeStart;
     }
   }
 
-  get progress() { return this.layer / this.dims[2]; }
+  get progress() {
+    if (!this.region) return this.layer / this.dims[2];
+    const { a, b } = this.region;
+    return (this.layer - a[2]) / Math.max(1, b[2] - a[2]);
+  }
+
+  // Bakes the scene again inside a region only, after an object there moved.
+  // Space further out keeps distances that may now be too short, which is safe,
+  // since rays step no further than MAX_STEP; the margin covers that and soft
+  // shadows. A region still pending is merged in.
+  rebake(bounds) {
+    const pad = MAX_STEP + this.voxel * 2 + 0.3;
+    if (this.region) bounds = unionBounds(this.region.bounds, bounds);
+    const toVoxel = (v, i, round) => Math.min(this.dims[i], Math.max(0, round((v - this.lo[i]) / this.voxel)));
+    const a = bounds.min.map((v, i) => toVoxel(v - pad, i, Math.floor));
+    const b = bounds.max.map((v, i) => toVoxel(v + pad, i, Math.ceil));
+    if (b.some((v, i) => v <= a[i])) return;
+    this.region = { bounds, a, b };
+    this.layer = a[2];
+    this.baking = true;
+    this.ready = false;
+    this.bakeStart = 0;
+  }
+
+  // The region a finished bake covered, in world units, for update().
+  get bakedBounds() {
+    if (!this.region) return { min: this.lo, max: this.lo.map((v, i) => v + this.fieldSize[i]) };
+    const { a, b } = this.region;
+    return { min: a.map((v, i) => this.lo[i] + v * this.voxel), max: b.map((v, i) => this.lo[i] + v * this.voxel) };
+  }
 
   // Rewrites the world texture inside a region and returns the voxels touched.
   update(region, edits) {

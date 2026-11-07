@@ -396,6 +396,13 @@ class Viewer {
     this.strip = 0;
     this.maxSamples = 16;
 
+    // The gizmo is drawn on a 2D canvas laid over this one.
+    this.overlay = document.createElement('canvas');
+    this.overlay.className = 'overlay';
+    this.overlay.setAttribute('aria-hidden', 'true');
+    canvas.after(this.overlay);
+    this.gizmo = new Gizmo(this, this.overlay);
+
     this.bindInput();
     canvas.addEventListener('webglcontextlost', (e) => {
       e.preventDefault();
@@ -430,6 +437,9 @@ class Viewer {
   }
 
   setScene(scene) {
+    this.gizmo.drag = null;
+    this.gizmo.hover = null;
+    this.transform = null;
     // A physics scene is a fixed world plus bodies, which the simulation moves.
     this.sim = null;
     this.bodyGrab = null;
@@ -439,18 +449,39 @@ class Viewer {
       this.sim = new PhysicsWorld({ world: spec.world.d });
       for (const { shape, name, ...options } of spec.bodies) this.sim.add(shape, options);
       tree = SDF.withBodies(spec.world, this.sim.bodies.map((b, i) => ({
-        shape: b.shape, radius: b.info.renderRadius, name: spec.bodies[i].name,
+        shape: b.shape, com: b.info.com, name: spec.bodies[i].name,
       })));
+      // Each body as the scene made it, so stretching can start from that.
+      this.bodyNames = spec.bodies.map((b, i) => b.name || `Body ${i + 1}`);
+      this.bodyBase = this.sim.bodies.map((b) => ({ shape: b.shape, com: [...b.info.com], radius: b.info.renderRadius }));
+      this.bodyStretch = this.sim.bodies.map(() => [1, 1, 1]);
+      this.bodyScale = new Float32Array(this.sim.bodies.length * 4).fill(1);
+      this.bodyRadius = new Float32Array(this.bodyBase.map((b) => b.radius));
     } else {
       tree = scene.build();
     }
     this.toolScale = scene.toolScale || 1;
+    // Kept for its CPU distance, shape.d, which follows moved objects too.
+    this.tree = tree;
     const compiled = SDF.compile(tree);
     this.sceneCode = compiled.code;
     // The scene's named objects, for the outliner. 1 in `hidden` hides one.
     this.objects = compiled.objects;
     this.hidden = new Float32Array(Math.max(1, this.objects.length));
     this.selected = -1;
+    // Where each named object has been moved to, turned and scaled by hand. See
+    // objectState(). The uniforms start as the identity.
+    this.frames = compiled.frames;
+    this.holders = compiled.holders;
+    this.states = [];
+    const named = Math.max(1, compiled.namedCount);
+    this.objM = new Float32Array(named * 9);
+    for (let i = 0; i < named; i++) this.objM.set([1, 0, 0, 0, 1, 0, 0, 0, 1], i * 9);
+    this.objO = new Float32Array(named * 3);
+    this.objS = new Float32Array(named).fill(1);
+    this.bodyOfObject = new Map();
+    if (this.sim) this.bodyNames.forEach((name, i) => this.bodyOfObject.set(this.objects.indexOf(name), i));
+    this.transform = null;
     this.animation = scene.animate ? scene : null;
     this.clock = 0;
     this.jointIndex = new Map(compiled.joints.map((name, i) => [name, i]));
@@ -474,6 +505,8 @@ class Viewer {
     this.bound = { center: scene.center, extent: scene.extent, radius: Math.hypot(...scene.extent) };
     // Rays march inside this box. An animated scene moves it along with the model.
     this.rayBox = { center: scene.center, extent: scene.movingExtent || scene.extent };
+    // The box as the scene gave it. Objects moved outside it make it grow.
+    this.sceneExtent = [...this.rayBox.extent];
     this.applyPose();
     this.applySimulation();
     this.cut = { axis: scene.cutAxis || 'z', amount: 0, flip: false };
@@ -522,7 +555,8 @@ class Viewer {
         this.gl.useProgram(this.baked.prog);
         this.gl.uniform1i(this.baked.uniforms.uField, 1);
       }
-      this.field = new DistanceField(this, this.sceneCode, this.bound.center, this.bound.extent, this.gridVoxels);
+      // The grid covers the ray box, which grows when an object is moved out of the scene's own.
+      this.field = new DistanceField(this, this.sceneCode, this.rayBox.center, this.rayBox.extent, this.gridVoxels);
     } catch (e) {
       this.mode = 'live';
       this.onError(`Could not build the baked renderer, so it is using Live mode.\n${e.message}`);
@@ -552,6 +586,8 @@ class Viewer {
       this.jointT.set(b.renderTranslation(), i * 3);
     });
     this.updateBodyBounds();
+    // Nudges the renderer: the refined image is now out of date.
+    this.activeUntil = performance.now() + 150;
   }
 
   // A coarse grid over the stage. Each cell holds a lower bound on the distance
@@ -579,7 +615,7 @@ class Viewer {
     data.fill(FAR);
     for (const b of this.sim.bodies) {
       const t = b.renderTranslation();
-      const r = b.info.renderRadius;
+      const r = this.bodyRadius[b.id];
       const reach = FAR + r + slack;
       const from = t.map((v, i) => Math.max(0, Math.floor((v - reach - lo[i]) / cell[i])));
       const to = t.map((v, i) => Math.min(dims[i] - 1, Math.floor((v + reach - lo[i]) / cell[i])));
@@ -610,7 +646,15 @@ class Viewer {
   }
 
   setPaused(paused) {
+    // Playing ends any drag of the gizmo, keeping what it did.
+    if (!paused) this.gizmo.release();
     this.paused = paused;
+    this.onChange();
+  }
+
+  // 'move', 'rotate', 'scale', or null to hide the gizmo.
+  setGizmo(mode) {
+    this.gizmo.setMode(mode);
     this.onChange();
   }
 
@@ -623,8 +667,11 @@ class Viewer {
     if (field.baking) {
       field.step(12);
       if (!field.baking) {
-        field.update({ min: field.lo, max: field.lo.map((v, i) => v + field.fieldSize[i]) }, this.edits);
-        field.ready = true;
+        field.update(field.bakedBounds, this.edits);
+        if (field.region && this.dirty) field.update(this.dirty, this.edits);
+        field.region = null;
+        // A drag still under way keeps showing Live.
+        field.ready = !this.transform;
         this.dirty = null;
         this.restart(this.moving);
       }
@@ -728,6 +775,17 @@ class Viewer {
     return { eye, forward, dir: d.map((c) => c / len) };
   }
 
+  // Where a world point appears on screen: [x, y] in CSS pixels, and its depth
+  // in front of the camera. Null when it is behind the camera.
+  project(p) {
+    const { clientWidth: w, clientHeight: h } = this.canvas;
+    const { eye, forward, right, up } = this.basis(this.cam);
+    const d = v3.sub(p, eye);
+    const z = v3.dot(d, forward);
+    if (z <= 1e-4) return null;
+    return [(v3.dot(d, right) / z * 3.2 * h + w) / 2, (h - v3.dot(d, up) / z * 3.2 * h) / 2, z];
+  }
+
   // Asks the GPU where the pointer's ray hits the model.
   pickSurface(x, y, includeBodies = false) {
     const out = this.pick(x, y, includeBodies);
@@ -812,11 +870,23 @@ class Viewer {
   }
 
   // Points the camera at an object, from the current direction, close enough
-  // to fill the view. Where the object is comes from the GPU: one pass samples
-  // a coarse grid over the scene and reports the nearest object at each point,
-  // so this works for mirrored, posed and simulated objects alike.
+  // to fill the view.
   frameObject(id) {
-    if (!this.pickFbo || id < 0 || id >= this.objects.length) return false;
+    const box = this.objectBounds(id);
+    if (!box) return false;
+    const radius = Math.hypot(...box.max.map((v, i) => v - box.min[i])) / 2;
+    this.goal.target = box.min.map((v, i) => (v + box.max[i]) / 2);
+    // A sphere of this radius fills the height of the view, with a margin.
+    this.goal.dist = radius * Math.hypot(1, 3.2) * 1.1;
+    return true;
+  }
+
+  // An object's box in the world, as it is now, or null. This comes from the
+  // GPU: one pass samples a coarse grid over the scene and reports the nearest
+  // object at each point, so this works for mirrored, posed and simulated
+  // objects alike.
+  objectBounds(id) {
+    if (!this.pickFbo || id < 0 || id >= this.objects.length) return null;
     const gl = this.gl;
     const { center, extent } = this.rayBox;
     const voxel = (Math.max(...extent) * 2) / 64;
@@ -832,7 +902,7 @@ class Viewer {
     gl.disable(gl.BLEND);
     gl.disable(gl.SCISSOR_TEST);
     gl.viewport(0, 0, w, h);
-    // A hidden object can still be framed.
+    // A hidden object can still be found.
     const wasHidden = this.hidden[id];
     this.hidden[id] = 0;
     this.draw(false, w, h, [0, 0], false, { lo, dims, voxel });
@@ -852,13 +922,275 @@ class Viewer {
       const cell = [k % w, row % dims[1], Math.floor(row / dims[1])];
       cell.forEach((c, i) => { min[i] = Math.min(min[i], c); max[i] = Math.max(max[i], c + 1); });
     }
-    if (min[0] === Infinity) return false;
-    const a = min.map((c, i) => lo[i] + c * voxel);
-    const b = max.map((c, i) => lo[i] + c * voxel);
-    const radius = Math.hypot(...b.map((v, i) => v - a[i])) / 2;
-    this.goal.target = a.map((v, i) => (v + b[i]) / 2);
-    // A sphere of this radius fills the height of the view, with a margin.
-    this.goal.dist = radius * Math.hypot(1, 3.2) * 1.1;
+    if (min[0] === Infinity) return null;
+    return { min: min.map((c, i) => lo[i] + c * voxel), max: max.map((c, i) => lo[i] + c * voxel) };
+  }
+
+  // ---- moving, turning and scaling objects ---------------------------------------
+  //
+  // A named object keeps a translation t, a rotation R and a scale S, applied
+  // about its pivot, the centre of its box when first selected:
+  //
+  //   parent = pivot + t + R * S * (local - pivot)
+  //
+  // `parent` is the space the object was named in: the world, unless it sits
+  // inside a move(), rotate(), scale() or pose(). parentFrame() gives that space.
+  // A physics body is moved through the simulation instead, and keeps only a
+  // stretch about its centre of mass here.
+
+  // Objects can be changed at any time except while the simulation runs.
+  get canTransform() { return !(this.sim && !this.paused) && !!this.objects && !!this.pickFbo; }
+
+  // The space an object was named in, as world = L * parent + t.
+  parentFrame(id) {
+    let L = m3.identity();
+    let t = [0, 0, 0];
+    for (const step of this.frames[id] || []) {
+      let A = m3.identity();
+      let b = [0, 0, 0];
+      if (step.move) b = step.move;
+      else if (step.rotate) A = step.rotate;
+      else if (step.scale) A = [step.scale, 0, 0, 0, step.scale, 0, 0, 0, step.scale];
+      else if (step.joint !== undefined) {
+        A = [...this.jointR.subarray(step.joint * 9, step.joint * 9 + 9)];
+        b = [...this.jointT.subarray(step.joint * 3, step.joint * 3 + 3)];
+      }
+      // Folds (mirror, polar, grid, twist) have no single frame. The object
+      // is changed in the folded space instead; see the note in sdf.js.
+      t = v3.add(mulMat3(L, b), t);
+      L = m3.mul(L, A);
+    }
+    return { L, t };
+  }
+
+  // An object's transform, made the first time it is needed.
+  objectState(id) {
+    if (this.states[id]) return this.states[id];
+    const box = this.objectBounds(id);
+    if (!box) return null;
+    // The box in the parent's space, from the corners of the world box.
+    const { L, t } = this.parentFrame(id);
+    const inv = invertMat3(L);
+    const min = [Infinity, Infinity, Infinity];
+    const max = [-Infinity, -Infinity, -Infinity];
+    for (let c = 0; c < 8; c++) {
+      const corner = [0, 1, 2].map((i) => ((c >> i) & 1 ? box.max[i] : box.min[i]));
+      const p = mulMat3(inv, v3.sub(corner, t));
+      p.forEach((v, i) => { min[i] = Math.min(min[i], v); max[i] = Math.max(max[i], v); });
+    }
+    const pivot = min.map((v, i) => (v + max[i]) / 2);
+    this.states[id] = { t: [0, 0, 0], R: m3.identity(), S: [1, 1, 1], pivot, box: { min, max } };
+    return this.states[id];
+  }
+
+  // Where the gizmo goes, and the object's own axes in the world.
+  transformFrame(id) {
+    const body = this.bodyOfObject.get(id);
+    if (body !== undefined) {
+      const b = this.sim.bodies[body];
+      return { pivot: [...b.x], local: [0, 1, 2].map((i) => m3.column(b.R, i)) };
+    }
+    const state = this.objectState(id);
+    if (!state) return null;
+    const { L, t } = this.parentFrame(id);
+    const LR = m3.mul(L, state.R);
+    return {
+      pivot: v3.add(mulMat3(L, v3.add(state.pivot, state.t)), t),
+      local: [0, 1, 2].map((i) => v3.norm(m3.column(LR, i))),
+    };
+  }
+
+  // An object's box in the world with its current transform.
+  worldBox(id) {
+    const state = this.states[id];
+    if (!state) return null;
+    const { L, t } = this.parentFrame(id);
+    const RS = m3.mul(state.R, [state.S[0], 0, 0, 0, state.S[1], 0, 0, 0, state.S[2]]);
+    const min = [Infinity, Infinity, Infinity];
+    const max = [-Infinity, -Infinity, -Infinity];
+    for (let c = 0; c < 8; c++) {
+      const corner = [0, 1, 2].map((i) => ((c >> i) & 1 ? state.box.max[i] : state.box.min[i]));
+      const parent = v3.add(v3.add(state.pivot, state.t), mulMat3(RS, v3.sub(corner, state.pivot)));
+      const p = v3.add(mulMat3(L, parent), t);
+      p.forEach((v, i) => { min[i] = Math.min(min[i], v); max[i] = Math.max(max[i], v); });
+    }
+    return { min, max };
+  }
+
+  // Hands an object's transform to the shaders and to its CPU distance.
+  // local = M * parent + O, with M = S^-1 * R^T, and the distance scaled by
+  // the smallest of S, which keeps it an underestimate when S is uneven.
+  applyObjectTransform(id) {
+    const { t, R, S, pivot } = this.states[id];
+    const M = [0, 1, 2].flatMap((r) => [0, 1, 2].map((c) => R[c * 3 + r] / S[r]));
+    const O = v3.sub(pivot, mulMat3(M, v3.add(pivot, t)));
+    const s = Math.min(...S);
+    const identity = t.every((v) => v === 0) && S.every((v) => v === 1) && R.every((v, i) => v === (i % 4 === 0 ? 1 : 0));
+    for (const holder of this.holders[id] || []) {
+      holder.M = identity ? null : M;
+      holder.O = O;
+      holder.s = s;
+    }
+    // GLSL reads matrices by column.
+    for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) this.objM[id * 9 + c * 3 + r] = M[r * 3 + c];
+    this.objO.set(O, id * 3);
+    this.objS[id] = s;
+  }
+
+  // A body's stretch, as the uniforms that draw it.
+  applyBodyStretch(i) {
+    const S = this.bodyStretch[i];
+    const { com, radius } = this.bodyBase[i];
+    this.bodyScale.set([1 / S[0], 1 / S[1], 1 / S[2], Math.min(...S)], i * 4);
+    // Every point of the shape lies within its radius of the origin, so after
+    // stretching about the centre of mass it lies within this.
+    const c = Math.hypot(...com);
+    const most = Math.max(...S);
+    this.bodyRadius[i] = most === 1 && Math.min(...S) === 1 ? radius : c + most * (radius + c);
+  }
+
+  setObjectUniforms(u) {
+    const gl = this.gl;
+    if (u['uHidden[0]']) gl.uniform1fv(u['uHidden[0]'], this.hidden);
+    if (u['uObjM[0]']) {
+      gl.uniformMatrix3fv(u['uObjM[0]'], false, this.objM);
+      gl.uniform3fv(u['uObjO[0]'], this.objO);
+      gl.uniform1fv(u['uObjS[0]'], this.objS);
+    }
+    if (u['uBodyScale[0]']) {
+      gl.uniform4fv(u['uBodyScale[0]'], this.bodyScale);
+      gl.uniform1fv(u['uBodyRadius[0]'], this.bodyRadius);
+    }
+  }
+
+  // Starts changing an object. Returns what is needed to undo it, or null.
+  beginTransform(id) {
+    if (!this.canTransform) return null;
+    const body = this.bodyOfObject.get(id);
+    if (body !== undefined) {
+      const b = this.sim.bodies[body];
+      this.transform = { id, body, x: [...b.x], q: [...b.q], S: [...this.bodyStretch[body]] };
+      return this.transform;
+    }
+    const state = this.objectState(id);
+    if (!state) return null;
+    this.transform = { id, t: [...state.t], R: [...state.R], S: [...state.S], before: this.worldBox(id) };
+    // The baked grid still shows the object where it was, so draw Live until
+    // the grid is brought up to date when the drag ends.
+    if (this.field && this.field.ready) {
+      this.field.ready = false;
+      this.transform.wasReady = true;
+    }
+    this.onChange();
+    return this.transform;
+  }
+
+  // Applies a change, relative to where the drag began:
+  //   { move: [x, y, z] }            in world units
+  //   { rotate: { axis, angle } }    about a world axis through the pivot, radians
+  //   { scale: [x, y, z] }           factors along the object's own axes
+  updateTransform(change) {
+    const tr = this.transform;
+    if (!tr) return;
+    if (tr.body !== undefined) {
+      const b = this.sim.bodies[tr.body];
+      if (change.move) b.place(v3.add(tr.x, change.move), tr.q);
+      if (change.rotate) b.place(tr.x, quatMul(quatAxisAngle(change.rotate.axis, change.rotate.angle), tr.q));
+      if (change.scale) {
+        this.bodyStretch[tr.body] = tr.S.map((v, i) => Math.min(50, Math.max(0.02, v * change.scale[i])));
+        this.applyBodyStretch(tr.body);
+      }
+      this.applySimulation();
+    } else {
+      const state = this.states[tr.id];
+      const { L } = this.parentFrame(tr.id);
+      const inv = invertMat3(L);
+      if (change.move) state.t = v3.add(tr.t, mulMat3(inv, change.move));
+      if (change.rotate) {
+        // The turn in world space, carried into the parent's space.
+        const turn = m3.mul(m3.mul(inv, m3.axisAngle(change.rotate.axis, change.rotate.angle)), L);
+        state.R = m3.mul(turn, tr.R);
+      }
+      if (change.scale) state.S = tr.S.map((v, i) => Math.min(50, Math.max(0.02, v * change.scale[i])));
+      this.applyObjectTransform(tr.id);
+    }
+    this.activeUntil = performance.now() + 150;
+  }
+
+  // Finishes a change, or puts the object back if cancelled.
+  endTransform(cancel) {
+    const tr = this.transform;
+    if (!tr) return;
+    this.transform = null;
+    if (tr.body !== undefined) {
+      const b = this.sim.bodies[tr.body];
+      if (cancel) {
+        b.place(tr.x, tr.q);
+        this.bodyStretch[tr.body] = tr.S;
+        this.applyBodyStretch(tr.body);
+      } else if (this.bodyStretch[tr.body].some((v, i) => v !== tr.S[i])) {
+        // Physics measures the stretched shape again: its mass, inertia and samples.
+        const S = this.bodyStretch[tr.body];
+        const base = this.bodyBase[tr.body];
+        b.setShape(S.every((v) => v === 1) ? base.shape : base.shape.stretch(S, base.com));
+      }
+      this.sim.forgetContacts();
+      this.applySimulation();
+    } else {
+      const state = this.states[tr.id];
+      if (cancel) {
+        Object.assign(state, { t: tr.t, R: tr.R, S: tr.S });
+        this.applyObjectTransform(tr.id);
+      }
+      if (this.sim) this.sim.forgetContacts();
+      const after = this.worldBox(tr.id);
+      const unchanged = cancel || JSON.stringify(tr.before) === JSON.stringify(after);
+      if (this.fitRayBox()) {
+        // The grid no longer covers everything, so bake a bigger one.
+        if (this.field) this.disposeField();
+      } else if (this.field && !unchanged) {
+        // Only the space around the object, before and after, needs baking again.
+        if (this.field.baking && !this.field.region) this.disposeField();
+        else this.field.rebake(unionBounds(tr.before, after));
+      } else if (this.field && tr.wasReady && !this.field.baking) {
+        this.field.ready = true;
+      }
+    }
+    this.activeUntil = performance.now() + 150;
+    this.onChange();
+  }
+
+  // Grows the ray box to hold every object moved by hand. Rays only march
+  // inside it, so anything outside would vanish. Returns whether it changed.
+  fitRayBox() {
+    const { center } = this.rayBox;
+    const extent = [...this.sceneExtent];
+    this.states.forEach((state, id) => {
+      if (!state) return;
+      const box = this.worldBox(id);
+      for (let c = 0; c < 8; c++) {
+        const corner = [0, 1, 2].map((i) => ((c >> i) & 1 ? box.max[i] : box.min[i]));
+        const d = v3.sub(corner, center);
+        if (this.animation) {
+          // The box follows a moving model, which may turn, so allow for any heading.
+          const across = Math.hypot(d[0], d[2]);
+          extent[0] = Math.max(extent[0], across);
+          extent[2] = Math.max(extent[2], across);
+          extent[1] = Math.max(extent[1], Math.abs(d[1]));
+        } else {
+          d.forEach((v, i) => { extent[i] = Math.max(extent[i], Math.abs(v)); });
+        }
+      }
+    });
+    // Keep the box when it still fits, so small moves do not need a whole new
+    // grid. When it must grow, leave room, for the same reason.
+    const current = this.rayBox.extent;
+    const fits = extent.every((e, i) => e <= current[i]);
+    const tooBig = current.some((e, i) => e > this.sceneExtent[i] && extent[i] < e * 0.6);
+    if (fits && !tooBig) return false;
+    const grown = extent.map((e, i) => (e > this.sceneExtent[i] ? e + Math.max(0.25, e * 0.2) : e));
+    this.rayBox.extent = grown;
+    this.updateCutPlane();
     return true;
   }
 
@@ -893,7 +1225,9 @@ class Viewer {
     }
     if (this.mode === 'live') return `Live: evaluating the whole scene at every ray step · ${this.frameMs.toFixed(0)} ms/frame`;
     if (!f) return 'Compiling shaders…';
+    if (f.baking && f.region) return `Updating the grid around the moved object ${Math.round(f.progress * 100)}% · showing Live until it finishes`;
     if (f.baking) return `Baking ${Math.round(f.progress * 100)}% · showing Live until it finishes`;
+    if (!f.ready) return `Live while moving · ${this.frameMs.toFixed(0)} ms/frame`;
     const mb = Math.round((f.voxelCount * 2 * 2) / 1e6);
     const parts = [
       `Grid ${f.dims.join('×')}`,
@@ -940,6 +1274,18 @@ class Viewer {
     c.addEventListener('pointerdown', (e) => {
       c.setPointerCapture(e.pointerId);
       pointers.set(e.pointerId, [e.clientX, e.clientY]);
+      // A second finger, or another button, cancels a gizmo drag.
+      if (this.gizmo.drag) {
+        if (pointers.size > 1 || e.button !== 0) this.gizmo.cancel();
+        return;
+      }
+      // The gizmo's handles come first, so they can be grabbed over the model.
+      if (pointers.size === 1 && e.button === 0 && !e.shiftKey && !this.looking && this.tool === 'orbit'
+        && this.gizmo.press(e.clientX, e.clientY)) {
+        click = null;
+        c.classList.add('dragging');
+        return;
+      }
       click = pointers.size === 1 && e.button === 0 && this.tool === 'orbit' && !this.looking ? [e.clientX, e.clientY] : null;
       c.classList.add('dragging');
       pinch = 0;
@@ -956,7 +1302,7 @@ class Viewer {
         const edit = this.editAt(e.clientX, e.clientY);
         if (edit) {
           this.grabEdit(edit, e.clientX, e.clientY);
-        } else if (this.sim) {
+        } else if (this.sim && !this.paused) {
           // Pick a body up. It is pulled towards the pointer by a spring.
           const hit = this.pickSurface(e.clientX, e.clientY, true);
           const body = hit && this.sim.bodyAt(...hit);
@@ -969,6 +1315,12 @@ class Viewer {
     });
     c.addEventListener('pointermove', (e) => {
       const last = pointers.get(e.pointerId);
+      if (this.gizmo.drag) {
+        // Pressing another button while dragging cancels, as in Blender.
+        if (e.buttons & 2) this.gizmo.cancel();
+        else this.gizmo.move(e.clientX, e.clientY, e.ctrlKey || e.metaKey);
+        return;
+      }
       // While flying or holding Space, the pointer turns the head, pressed or
       // not, so a trackpad can steer without clicking.
       if (this.looking && !this.grab && !this.bodyGrab && pointers.size <= 1) {
@@ -977,7 +1329,9 @@ class Viewer {
         return;
       }
       if (!last) {
-        this.hover = this.editAt(e.clientX, e.clientY);
+        const overGizmo = this.tool === 'orbit' && this.gizmo.hoverAt(e.clientX, e.clientY);
+        c.classList.toggle('over-gizmo', overGizmo);
+        this.hover = overGizmo ? null : this.editAt(e.clientX, e.clientY);
         c.classList.toggle('over-edit', !!this.hover);
         return;
       }
@@ -1005,6 +1359,10 @@ class Viewer {
       }
     });
     const release = (e) => {
+      if (this.gizmo.drag) {
+        if (e.type === 'pointercancel') this.gizmo.cancel();
+        else this.gizmo.release();
+      }
       if (click && e.type === 'pointerup' && !this.grab && Math.hypot(e.clientX - click[0], e.clientY - click[1]) < 4) {
         const rect = c.getBoundingClientRect();
         this.select(this.objectAt(e.clientX - rect.left, e.clientY - rect.top));
@@ -1035,7 +1393,19 @@ class Viewer {
     addEventListener('keydown', (e) => {
       if (typing(e)) return;
       if ((e.key === 'Delete' || e.key === 'Backspace') && this.hover) this.removeEdit(this.hover);
-      if (e.key === 'Escape') { this.setTool('orbit'); this.select(-1); }
+      if (e.key === 'Escape') {
+        // Escape first cancels a drag of the gizmo, and only then deselects.
+        if (this.gizmo.drag) { this.gizmo.cancel(); c.classList.remove('dragging'); return; }
+        this.setTool('orbit');
+        this.select(-1);
+      }
+      const plain = !e.metaKey && !e.ctrlKey && !e.altKey;
+      // G, R and T pick the gizmo: move (grab, as in Blender), rotate, scale.
+      // S is taken by flying, so scale is T.
+      const gizmoKeys = { KeyG: 'move', KeyR: 'rotate', KeyT: 'scale' };
+      if (plain && gizmoKeys[e.code] && !this.gizmo.drag) this.setGizmo(gizmoKeys[e.code]);
+      // P plays or pauses a simulation or an animation.
+      if (plain && e.code === 'KeyP' && this.liveOnly) this.setPaused(!this.paused);
       // F frames the selected object, as in Unreal.
       if (e.code === 'KeyF' && !e.metaKey && !e.ctrlKey && !e.altKey && this.selected >= 0) this.frameObject(this.selected);
       // H hides the selected object, as in Blender.
@@ -1173,7 +1543,7 @@ class Viewer {
       gl.uniformMatrix3fv(u['uJointR[0]'], false, this.jointR);
       gl.uniform3fv(u['uJointT[0]'], this.jointT);
     }
-    if (u['uHidden[0]']) gl.uniform1fv(u['uHidden[0]'], this.hidden);
+    this.setObjectUniforms(u);
     gl.uniform1f(u.uHQ, hq ? 1 : 0);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
   }
@@ -1216,6 +1586,7 @@ class Viewer {
       this.applySimulation();
     }
     if (this.keys.size) this.fly(dt, this.keys.has('ShiftLeft') || this.keys.has('ShiftRight'));
+    this.gizmo.update();
     if (this.ease() || animating || simulating || now < (this.activeUntil || 0)) this.restart(true);
     else if (this.moving) this.restart(false);
     if (this.moving) this.frameMs += (dt - this.frameMs) * 0.1;

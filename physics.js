@@ -30,8 +30,11 @@ const PHYSICS = {
   restitution: 0.2,
   rollingResistance: 0.012, // a torque, as a length: how far the load sits off-centre
   slop: 0.002,         // overlap allowed at rest, so resting contacts stay in touch
-  maxPushSpeed: 6,     // deep overlaps separate at this speed, not explosively
-  softPushSpeed: 4,    // the same limit, for contacts from the overlap search
+  // Overlap left over is repaired gently when shallow and faster when deep. Fast
+  // repairs of shallow overlaps fed energy into anything also held by the pointer.
+  repairSpeed: 0.5,    // units per second, for overlap just past the allowance
+  repairPerDepth: 4,   // extra speed per unit of overlap
+  maxPushSpeed: 6,     // never faster than this
   maxSpeed: 40,
   sleepSpeed: 0.12,
   sleepAfter: 0.6,
@@ -1012,9 +1015,9 @@ class PhysicsWorld {
       allowed = c.depth;
     } else if (c.soft) {
       // A single point on a long body is a lever, so ease out of what is left.
-      allowed = closing + Math.min(Math.max(c.depth - PHYSICS.slop - closing, 0) * 0.2, PHYSICS.softPushSpeed * h);
+      allowed = closing + Math.min(Math.max(c.depth - PHYSICS.slop - closing, 0) * 0.2, this.repairLimit(c.depth) * h);
     } else {
-      allowed = Math.max(closing, Math.min(c.depth - PHYSICS.slop, PHYSICS.maxPushSpeed * h));
+      allowed = Math.max(closing, Math.min(c.depth - PHYSICS.slop, this.repairLimit(c.depth) * h));
     }
     const remaining = allowed - dot3(moved, n);
     if (remaining <= 0) return;
@@ -1048,6 +1051,10 @@ class PhysicsWorld {
       A.applyRepair(rA, push, 1);
       if (B) B.applyRepair(rB, push, -1);
     }
+  }
+
+  repairLimit(depth) {
+    return Math.min(PHYSICS.repairSpeed + PHYSICS.repairPerDepth * depth, PHYSICS.maxPushSpeed);
   }
 
   // All contacts between two bodies act as one patch. Friction applied at the

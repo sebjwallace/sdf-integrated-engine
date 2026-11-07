@@ -298,7 +298,7 @@ SDF.scenes.physics = {
   cutAxis: 'z',
   toolScale: 2.4,
   physics() {
-    const { box, sphere, cylinder, torus, capsule, union, subtract, material } = SDF;
+    const { box, sphere, cylinder, torus, capsule, ellipsoid, union, subtract, intersect, material } = SDF;
     const ground = material('#3a4048', 0.55, 0.1);
     const fixture = material('#b8bcc2', 0.3, 1);
 
@@ -354,9 +354,25 @@ SDF.scenes.physics = {
       { shape: beam, at: [-1.5, 4.8, 2.1], rotate: [0, 100, 0] },
       { shape: beam, at: [-1.7, 4.2, 1.9], rotate: [0, 60, 0] },
     );
+    // An anchor: the awkward shape. It has a thin eye that can hook and thread,
+    // concave arms that catch things, broad flat flukes, a crossbar that tips it on
+    // its side, most of its weight low down, and smooth blends where parts meet.
+    bodies.push({ shape: ANCHOR.paint('#c08a3e', 0.35, 0.8), at: [0.6, 5.6, 0.4], rotate: [20, 35, 70] });
     return { world, bodies };
   },
 };
+
+const ANCHOR = (() => {
+  const { torus, capsule, ellipsoid, box, union, intersect } = SDF;
+  const shaft = capsule([0, -0.45, 0], [0, 0.42, 0], 0.06);
+  const eye = torus(0.13, 0.035).rotate(90).move(0, 0.58, 0);
+  const crossbar = capsule([0, 0.32, -0.32], [0, 0.32, 0.32], 0.04);
+  // The arms are the lower half of a ring, standing in the plane of the shaft.
+  const arms = intersect(torus(0.38, 0.055).rotate(90).move(0, -0.08, 0), box(1, 0.5, 0.2).move(0, -0.33, 0));
+  const fluke = ellipsoid(0.11, 0.15, 0.035).rotate(0, 0, -35);
+  const flukes = union(fluke.move(0.36, 0, 0), fluke.rotate(0, 180, 0).move(-0.36, 0, 0));
+  return union(shaft, eye, crossbar, arms, flukes).smooth(0.025);
+})();
 
 SDF.scenes.mug = {
   label: 'Coffee mug',

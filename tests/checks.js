@@ -253,5 +253,42 @@ window.runChecks = () => {
     const moved = group.filter((b, i) => Math.hypot(b.x[0] - start[i][0], b.x[2] - start[i][2]) > 0.15).length;
     check('lively', `break shot scatters a ${asleep ? 'sleeping' : 'resting'} group (cubes moved, of 6)`, moved, moved >= 3, '3 or more');
   }
+
+  // --- An awkward shape: the playground's anchor. Thin eye, concave arms, flat flukes,
+  // weight low down, and smooth blends where its parts meet.
+  {
+    const com = analyseShape(ANCHOR).com;
+    const eyeOf = (b) => mulMat3(b.R, [-com[0], 0.58 - com[1], -com[2]]).map((v, i) => v + b.x[i]);
+    {
+      const w = new PhysicsWorld(); const b = w.add(ANCHOR, { at: [0, 1.5, 0], rotate: [0, 0, 10] });
+      const e0 = w.totalEnergy(); let gain = 0; let slept = -1;
+      for (let f = 0; f < 1200; f++) { w.step(1 / 60); gain = Math.max(gain, w.totalEnergy() - e0); if (b.sleeping) { slept = f / 60; break; } }
+      const tilt = Math.acos(Math.abs(b.R[4])) * 180 / Math.PI;
+      check('anchor', 'dropped on the floor, ends on its side (shaft tilt)', +tilt.toFixed(0), tilt > 45, '> 45');
+      check('anchor', 'dropped on the floor, energy gained', +(gain / b.mass).toFixed(4), gain <= 0, '0');
+      check('anchor', 'dropped on the floor, settles (s)', slept < 0 ? '>20' : +slept.toFixed(1), slept >= 0, 'within 20');
+    }
+    {
+      const peg = cylinder(0.05, 2).move(0, 1, 0); const w = new PhysicsWorld({ world: peg.d });
+      const b = w.add(ANCHOR, { at: [0, 2.4, -0.58], rotate: [90, 0, 0] });
+      for (let f = 0; f < 600; f++) w.step(1 / 60);
+      const e = eyeOf(b);
+      check('anchor', 'eye threads a thin peg (distance from axis)', +Math.hypot(e[0], e[2]).toFixed(3), Math.hypot(e[0], e[2]) < 0.1, '< 0.1');
+    }
+    {
+      // Known and open: a thin peg's tip driven into the end of the thin shaft.
+      const peg = cylinder(0.05, 2).move(0, 1, 0); const w = new PhysicsWorld({ world: peg.d });
+      const b = w.add(ANCHOR, { at: [0, 2.6, 0], rotate: [0, 0, 180] });
+      let deep = 0;
+      for (let f = 0; f < 300; f++) {
+        w.step(1 / 60);
+        // Both ways round: the anchor's samples inside the peg, and the peg's surface
+        // inside the anchor, so a thin overlap cannot hide between samples.
+        for (const p of b.info.points) { const r = mulMat3(b.R, p); deep = Math.max(deep, -Math.min(0, peg.d(b.x[0] + r[0], b.x[1] + r[1], b.x[2] + r[2]))); }
+        for (let y = 0; y <= 2; y += 0.02) for (let k = 0; k < 8; k++) { const a = k * Math.PI / 4; deep = Math.max(deep, -Math.min(0, b.dist(0.05 * Math.cos(a), y, 0.05 * Math.sin(a)))); }
+      }
+      results.push({ group: 'anchor', name: 'thin peg tip into the thin shaft, deepest (m)', value: +deep.toFixed(4), pass: deep < 0.01, want: '< 0.01', open: true });
+    }
+  }
   return { results, measurements: m };
 };

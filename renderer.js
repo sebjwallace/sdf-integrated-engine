@@ -357,6 +357,9 @@ class Viewer {
     this.cam = { theta: 30, phi: 15, dist: 6, target: [0, 0.5, 0] };
     this.goal = { ...this.cam };
     this.previewScale = 0.6;
+    // Render resolution as a fraction of the screen's, or 0 for automatic:
+    // lower while moving to hold the frame rate, full when still.
+    this.quality = 0;
     this.strips = 1;
     this.sample = 0;
     this.strip = 0;
@@ -743,17 +746,28 @@ class Viewer {
     this.moveEdit(edit, hit ? hit.map((v, i) => v + offset[i]) : this.onDragPlane(x, y, edit.pos));
   }
 
+  setQuality(scale) {
+    this.quality = scale;
+    this.restart(false);
+  }
+
+  // The resolution being drawn at, as a fraction of the screen's.
+  get renderScale() {
+    if (this.quality) return this.quality;
+    return this.moving ? this.previewScale : 1;
+  }
+
   describe() {
     const f = this.field;
     if (this.sim) {
       const { bodies, stats } = this.sim;
       const asleep = bodies.length - this.sim.awakeCount;
-      return `${bodies.length} bodies, ${asleep} asleep · physics ${stats.stepMs.toFixed(1)} ms/step, ${stats.contacts} contacts · ${(this.previewScale * 100).toFixed(0)}% resolution · ${this.frameMs.toFixed(0)} ms/frame`;
+      return `${bodies.length} bodies, ${asleep} asleep · physics ${stats.stepMs.toFixed(1)} ms/step, ${stats.contacts} contacts · ${(this.renderScale * 100).toFixed(0)}% resolution · ${this.frameMs.toFixed(0)} ms/frame`;
     }
     if (this.animation) {
       return this.paused
         ? 'Paused · refining to full quality'
-        : `Animated with ${this.jointIndex.size} joints · Live · ${(this.previewScale * 100).toFixed(0)}% resolution · ${this.frameMs.toFixed(0)} ms/frame`;
+        : `Animated with ${this.jointIndex.size} joints · Live · ${(this.renderScale * 100).toFixed(0)}% resolution · ${this.frameMs.toFixed(0)} ms/frame`;
     }
     if (this.mode === 'live') return `Live: evaluating the whole scene at every ray step · ${this.frameMs.toFixed(0)} ms/frame`;
     if (!f) return 'Compiling shaders…';
@@ -887,7 +901,7 @@ class Viewer {
     // Fly keys, as in Unity and Unreal: WASD moves, Q and E go down and up,
     // Shift goes faster. Held keys are applied each frame in fly().
     this.keys = new Set();
-    const typing = (e) => e.target.closest && e.target.closest('input, select, textarea, [contenteditable]');
+    const typing = (e) => e.target.closest && e.target.closest('input:not([type=range]), select, textarea, [contenteditable]');
     addEventListener('keydown', (e) => {
       if (typing(e)) return;
       if ((e.key === 'Delete' || e.key === 'Backspace') && this.hover) this.removeEdit(this.hover);
@@ -1056,19 +1070,23 @@ class Viewer {
 
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbo);
 
+    // A fixed quality draws the same image moving or still, so nothing pops when
+    // the camera stops; only anti-aliasing is added while still.
+    const fixed = this.quality > 0;
     if (this.moving) {
       // Hold preview frame rate by trading resolution.
-      if (this.drewLast) {
+      if (this.drewLast && !fixed) {
         if (dt > 30) this.previewScale = Math.max(0.2, this.previewScale * 0.88);
         else if (dt < 19) this.previewScale = Math.min(1, this.previewScale * 1.04);
       }
-      const w = Math.max(1, Math.round(width * this.previewScale));
-      const h = Math.max(1, Math.round(height * this.previewScale));
+      const scale = this.renderScale;
+      const w = Math.max(1, Math.round(width * scale));
+      const h = Math.max(1, Math.round(height * scale));
       gl.disable(gl.BLEND);
       gl.disable(gl.SCISSOR_TEST);
       gl.viewport(0, 0, w, h);
       // Animated scenes are the final image, so keep shadows and reflections on.
-      this.draw(!!this.animation, w, h, [0, 0]);
+      this.draw(!!this.animation || fixed, w, h, [0, 0]);
       this.show(w / width, h / height);
       this.drewLast = true;
       return;
@@ -1087,25 +1105,28 @@ class Viewer {
     const n = this.sample;
     const halton = (i, b) => { let f = 1, r = 0; while (i > 0) { f /= b; r += f * (i % b); i = Math.floor(i / b); } return r; };
     const jitter = n === 0 ? [0, 0] : [halton(n, 2) - 0.5, halton(n, 3) - 0.5];
-    gl.viewport(0, 0, width, height);
+    const scale = this.renderScale;
+    const w = Math.max(1, Math.round(width * scale));
+    const h = Math.max(1, Math.round(height * scale));
+    gl.viewport(0, 0, w, h);
     gl.enable(gl.SCISSOR_TEST);
-    const y0 = Math.floor((this.strip * height) / this.strips);
-    const y1 = Math.floor(((this.strip + 1) * height) / this.strips);
-    gl.scissor(0, y0, width, y1 - y0);
+    const y0 = Math.floor((this.strip * h) / this.strips);
+    const y1 = Math.floor(((this.strip + 1) * h) / this.strips);
+    gl.scissor(0, y0, w, y1 - y0);
     if (n === 0) gl.disable(gl.BLEND);
     else {
       gl.enable(gl.BLEND);
       gl.blendFunc(gl.CONSTANT_ALPHA, gl.ONE_MINUS_CONSTANT_ALPHA);
       gl.blendColor(0, 0, 0, 1 / (n + 1));
     }
-    this.draw(true, width, height, jitter);
+    this.draw(true, w, h, jitter);
     this.drewLast = true;
 
     this.strip++;
     if (this.strip >= this.strips) {
       this.strip = 0;
       this.sample++;
-      this.show(1, 1);
+      this.show(w / width, h / height);
     }
   }
 }

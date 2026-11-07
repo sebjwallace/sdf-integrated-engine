@@ -23,6 +23,9 @@
         <option value="16000000" selected>16M voxels</option>
         <option value="64000000">64M voxels</option>
       </select>
+      <label for="quality">Quality</label>
+      <input id="quality" type="range" min="0" max="4" step="1" value="0" aria-describedby="quality-value">
+      <output id="quality-value" for="quality">Auto</output>
     </div>
     <div class="row" role="group" aria-label="Edit tools">
       <button data-tool="hole" aria-pressed="false">Add hole</button>
@@ -75,6 +78,8 @@
       const cutValue = document.getElementById('cut-value');
       const pauseButton = document.getElementById('pause');
       const dropButton = document.getElementById('drop');
+      const qualitySlider = document.getElementById('quality');
+      const qualityValue = document.getElementById('quality-value');
       const refresh = () => {
         const v = window.viewer;
         if (!v) return;
@@ -102,6 +107,20 @@
 
       const viewer = new Viewer(document.getElementById('view'), showError, refresh);
       window.viewer = viewer; // handy from the devtools console
+
+      // Quality: Auto, then a fixed 25 to 100% of the screen's resolution.
+      // Remembered per browser; storage may be unavailable, which is fine.
+      const QUALITY = [0, 0.25, 0.5, 0.75, 1];
+      const setQuality = (step) => {
+        qualitySlider.value = step;
+        qualityValue.textContent = step > 0 ? `${QUALITY[step] * 100}%` : 'Auto';
+        viewer.setQuality(QUALITY[step]);
+        try { localStorage.setItem('quality', step); } catch {}
+      };
+      let savedQuality = 0;
+      try { savedQuality = +localStorage.getItem('quality') || 0; } catch {}
+      setQuality(QUALITY[savedQuality] !== undefined ? savedQuality : 0);
+      qualitySlider.addEventListener('input', () => setQuality(+qualitySlider.value));
 
       modePicker.addEventListener('change', () => viewer.setMode(modePicker.value));
       gridPicker.addEventListener('change', () => viewer.setGrid(+gridPicker.value));

@@ -80,6 +80,13 @@ output {
   font-variant-numeric: tabular-nums;
 }
 
+#quality {
+  flex: 0 1 110px;
+  min-width: 90px;
+}
+
+#quality-value { min-width: 4ch; }
+
 #stats {
   margin: 0;
   color: var(--muted);

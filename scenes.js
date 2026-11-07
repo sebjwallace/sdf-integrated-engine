@@ -83,7 +83,10 @@ SDF.scenes.car = {
     const well = (x) => cylinder(0.385, 0.45).rotate(90).move(x, 0.32, 0.45).paint(trim);
 
     // Everything is modelled once, on the +z side, and mirrored.
-    return union(body, well(1.36), well(-1.36), cabin.paint(paintwork), panes, lamps, details, wheels).mirror('z');
+    return union(
+      body.named('Body'), union(well(1.36), well(-1.36)).named('Wheel wells'), cabin.paint(paintwork).named('Cabin'),
+      panes.named('Windows'), lamps.named('Lamps'), details.named('Trim'), wheels.named('Wheels'),
+    ).mirror('z');
   },
 };
 
@@ -178,10 +181,9 @@ SDF.scenes.robot = {
     ).pose(`shoulder${name}`);
 
     const body = union(
-      torso.move(0, 0.68, 0), dial.move(0, 0.68, 0),
-      cylinder(0.11, 0.2).move(0, 1.4, 0).paint(joint),
-      head,
-      ...SIDES.map(([name, side]) => arm(name, side)),
+      union(torso.move(0, 0.68, 0), dial.move(0, 0.68, 0), cylinder(0.11, 0.2).move(0, 1.4, 0).paint(joint)).named('Torso'),
+      head.named('Head'),
+      ...SIDES.map(([name, side]) => arm(name, side).named(`Arm ${name}`)),
     ).pose('body');
 
     const leg = (name) => union(
@@ -192,7 +194,7 @@ SDF.scenes.robot = {
       ).pose(`knee${name}`),
     ).pose(`hip${name}`);
 
-    return union(body, ...SIDES.map(([name]) => leg(name))).pose('root');
+    return union(body, ...SIDES.map(([name]) => leg(name).named(`Leg ${name}`))).pose('root');
   },
 
   animate(t, set) {
@@ -284,7 +286,10 @@ SDF.scenes.valve = {
     const stand = box(0.36, 0.34, 0.6).round(0.02).move(1.3, -0.75, 0).mirror('x').paint(casting);
     const plate = box(3.2, 0.06, 1).round(0.02).move(0, -0.92, 0).paint('#26292e', 0.5);
 
-    return union(housing, bolts, seats, ball, stem, packing, lever, stand, plate).move(0, 1, 0);
+    return union(
+      housing.named('Housing'), bolts.named('Bolts'), seats.named('Seats'), ball.named('Ball'), stem.named('Stem'),
+      packing.named('Packing'), lever.named('Lever'), stand.named('Stands'), plate.named('Base plate'),
+    ).move(0, 1, 0);
   },
 };
 
@@ -315,10 +320,10 @@ SDF.scenes.physics = {
     const peg = cylinder(0.11, 1.8).move(0.1, 1.3, -0.4);
 
     const world = union(
-      union(tray, hills).smooth(0.35).paint(ground),
-      ramp.paint('#4f6d7a', 0.4, 0.2),
-      arch.paint(fixture),
-      peg.paint(fixture),
+      union(tray, hills).smooth(0.35).paint(ground).named('Tray'),
+      ramp.paint('#4f6d7a', 0.4, 0.2).named('Ramp'),
+      arch.paint(fixture).named('Arch'),
+      peg.paint(fixture).named('Peg'),
     );
 
     const ball = sphere(0.3);
@@ -327,6 +332,9 @@ SDF.scenes.physics = {
     const ring = torus(0.36, 0.09);
     const palette = ['#d9534f', '#e0a33a', '#5cb270', '#4f9bd9', '#a06cd5', '#e8e2d4'];
     const shapes = [ball, block, pill, ball, block, ring];
+    const kinds = ['Ball', 'Block', 'Pill', 'Ball', 'Block', 'Ring'];
+    const counts = {};
+    const nameFor = (kind) => `${kind} ${(counts[kind] = (counts[kind] || 0) + 1)}`;
 
     const bodies = [];
     let n = 0;
@@ -337,6 +345,7 @@ SDF.scenes.physics = {
           const shape = kind.paint(palette[n % palette.length], 0.32);
           bodies.push({
             shape,
+            name: nameFor(kinds[n % kinds.length]),
             at: [(i - 1) * 1.5 + 0.1 * layer, 3 + layer * 0.9, (j - 1) * 1.5 - 0.1 * layer],
             rotate: [n * 37, n * 53, n * 11],
           });
@@ -346,18 +355,18 @@ SDF.scenes.physics = {
     }
     // These two rings start directly over the peg, to test threading a hole.
     const hoop = ring.paint('#f2f2f2', 0.3);
-    bodies.push({ shape: hoop, at: [0.1, 2.7, -0.4], rotate: [6, 0, 4] });
+    bodies.push({ shape: hoop, name: 'Hoop', at: [0.1, 2.7, -0.4], rotate: [6, 0, 4] });
     // Thin beams, which meet each other with no surface sample near the crossing.
     const beam = box(0.14, 0.14, 2.6).paint('#d7dbe0', 0.35, 0.6);
     bodies.push(
-      { shape: beam, at: [-1.6, 5.4, 2], rotate: [0, 20, 0] },
-      { shape: beam, at: [-1.5, 4.8, 2.1], rotate: [0, 100, 0] },
-      { shape: beam, at: [-1.7, 4.2, 1.9], rotate: [0, 60, 0] },
+      { shape: beam, name: 'Beam 1', at: [-1.6, 5.4, 2], rotate: [0, 20, 0] },
+      { shape: beam, name: 'Beam 2', at: [-1.5, 4.8, 2.1], rotate: [0, 100, 0] },
+      { shape: beam, name: 'Beam 3', at: [-1.7, 4.2, 1.9], rotate: [0, 60, 0] },
     );
     // An anchor: the awkward shape. It has a thin eye that can hook and thread,
     // concave arms that catch things, broad flat flukes, a crossbar that tips it on
     // its side, most of its weight low down, and smooth blends where parts meet.
-    bodies.push({ shape: ANCHOR.paint('#c08a3e', 0.35, 0.8), at: [0.6, 5.6, 0.4], rotate: [20, 35, 70] });
+    bodies.push({ shape: ANCHOR.paint('#c08a3e', 0.35, 0.8), name: 'Anchor', at: [0.6, 5.6, 0.4], rotate: [20, 35, 70] });
     return { world, bodies };
   },
 };
@@ -388,8 +397,8 @@ SDF.scenes.mug = {
     );
     const handle = torus(0.4, 0.075).rotate(90).move(0.85, 0.74, 0);
     return union(
-      subtract(union(profile, handle).smooth(0.06), cylinder(0.71, 1.3).move(0, 0.8, 0)).paint('#2f7d78', 0.18),
-      cylinder(0.72, 1.06).move(0, 0.66, 0).paint('#2b1609', 0.08),
+      subtract(union(profile, handle).smooth(0.06), cylinder(0.71, 1.3).move(0, 0.8, 0)).paint('#2f7d78', 0.18).named('Mug'),
+      cylinder(0.72, 1.06).move(0, 0.66, 0).paint('#2b1609', 0.08).named('Coffee'),
     );
   },
 };
@@ -407,9 +416,9 @@ SDF.scenes.sculpture = {
     ).smooth(0.04).twist(0.9).paint('#c79a3a', 0.28, 1);
     const rings = torus(0.86, 0.035).grid([0, 0.9, 0], [0, 1, 0]).paint('#e8e4dc', 0.35);
     return union(
-      column.move(0, 1.57, 0),
-      rings.move(0, 1.57, 0),
-      cylinder(1.05, 0.1).round(0.02).move(0, 0.07, 0).paint('#17181b', 0.3),
+      column.move(0, 1.57, 0).named('Column'),
+      rings.move(0, 1.57, 0).named('Rings'),
+      cylinder(1.05, 0.1).round(0.02).move(0, 0.07, 0).paint('#17181b', 0.3).named('Base'),
     );
   },
 };

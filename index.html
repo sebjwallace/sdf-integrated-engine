@@ -49,7 +49,11 @@
     </div>
     <p id="stats" aria-live="off"></p>
   </header>
-  <p id="hint">Drag to rotate · Scroll to zoom · Shift-drag to pan · WASD to fly, Q/E down/up, Shift for speed · Move the pointer while flying, or hold Space, to look around · Double-click to reset<span id="edit-hints"> · Pick a tool, then press on the model · Drag an edit to move it · Scroll over it to resize · Delete removes it</span><span id="physics-hint" hidden> · Drag a body to throw it</span></p>
+  <details id="outliner" open>
+    <summary>Outliner</summary>
+    <ul id="objects" aria-label="Objects in the scene"></ul>
+  </details>
+  <p id="hint">Drag to rotate · Scroll to zoom · Shift-drag to pan · WASD to fly, Q/E down/up, Shift for speed · Move the pointer while flying, or hold Space, to look around · Double-click to reset · Click an object to select it, H hides it<span id="edit-hints"> · Pick a tool, then press on the model · Drag an edit to move it · Scroll over it to resize · Delete removes it</span><span id="physics-hint" hidden> · Drag a body to throw it</span></p>
   <p id="error" role="alert" hidden></p>
 
   <script src="sdf.js"></script>
@@ -78,12 +82,50 @@
       const cutValue = document.getElementById('cut-value');
       const pauseButton = document.getElementById('pause');
       const dropButton = document.getElementById('drop');
+      const objectList = document.getElementById('objects');
       const qualitySlider = document.getElementById('quality');
       const qualityValue = document.getElementById('quality-value');
+      // The outliner: one row per named object, with a visibility toggle.
+      const EYE = '<svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M1.5 8s2.4-4.5 6.5-4.5S14.5 8 14.5 8 12.1 12.5 8 12.5 1.5 8 1.5 8Z" fill="none" stroke="currentColor" stroke-width="1.3"/><circle cx="8" cy="8" r="2" fill="currentColor"/></svg>';
+      const EYE_SHUT = '<svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M1.5 8s2.4-4.5 6.5-4.5S14.5 8 14.5 8 12.1 12.5 8 12.5 1.5 8 1.5 8Z" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M2.5 13.5l11-11" stroke="currentColor" stroke-width="1.3"/></svg>';
+      let listed = null;
+      const refreshOutliner = (v) => {
+        if (listed !== v.objects) {
+          listed = v.objects;
+          objectList.replaceChildren(...v.objects.map((name, id) => {
+            const row = document.createElement('li');
+            const pick = document.createElement('button');
+            pick.className = 'object-name';
+            pick.textContent = name;
+            pick.addEventListener('click', () => v.select(v.selected === id ? -1 : id));
+            const eye = document.createElement('button');
+            eye.className = 'object-eye';
+            eye.addEventListener('click', () => v.setHidden(id, !v.hidden[id]));
+            row.append(pick, eye);
+            return row;
+          }));
+          document.getElementById('outliner').hidden = !v.objects.length;
+        }
+        [...objectList.children].forEach((row, id) => {
+          const hidden = v.hidden[id] > 0;
+          const [pick, eye] = row.children;
+          row.classList.toggle('selected', v.selected === id);
+          row.classList.toggle('hidden-object', hidden);
+          pick.setAttribute('aria-pressed', v.selected === id);
+          if (eye.dataset.hidden !== String(hidden)) {
+            eye.dataset.hidden = hidden;
+            eye.innerHTML = hidden ? EYE_SHUT : EYE;
+            eye.setAttribute('aria-label', `${hidden ? 'Show' : 'Hide'} ${v.objects[id]}`);
+            eye.title = hidden ? 'Show' : 'Hide';
+          }
+        });
+      };
+
       const refresh = () => {
         const v = window.viewer;
         if (!v) return;
         stats.textContent = v.describe();
+        if (v.objects) refreshOutliner(v);
         if (v.cut) {
           cutSlider.value = v.cut.amount * 100;
           cutAxis.value = v.cut.axis;

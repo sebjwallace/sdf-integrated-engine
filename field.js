@@ -45,7 +45,7 @@ Hit applyEditsHit(Hit m,vec3 p){
   for(int i=0;i<uEditCount;i++){
     float e=editDist(i,p),k=uEditSize[i].w;
     if(uEditLook[i].a>.5){
-      Hit b=Hit(e,uEditLook[i].rgb,uEditSurf[i].x,uEditSurf[i].y,uEditSurf[i].z);
+      Hit b=Hit(e,uEditLook[i].rgb,uEditSurf[i].x,uEditSurf[i].y,uEditSurf[i].z,-1.);
       // The shape melts over k, but colour changes over a narrower band.
       float d=k>0.?smin(m.d,e,k):min(m.d,e);
       if(k>0.)m=hBlend(m,b,k*.3);else m=hUnion(m,b);
@@ -136,6 +136,12 @@ void main(){
 }`);
     gl.useProgram(this.updateProgram.prog);
     gl.uniform1i(this.updateProgram.uniforms.uBase, 1);
+    // Hidden objects are left out of the bake.
+    const hidden = this.bakeProgram.uniforms['uHidden[0]'];
+    if (hidden) {
+      gl.useProgram(this.bakeProgram.prog);
+      gl.uniform1fv(hidden, viewer.hidden);
+    }
 
     this.layer = 0;
     this.baking = true;

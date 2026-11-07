@@ -11,6 +11,11 @@
 // compile(shape) produces `float treeMap(vec3)` for raymarching and
 // `Hit treeHit(vec3)`, which also carries the material, for shading.
 //
+// shape.named('Wheels') marks an object: something the outliner lists, which
+// can be selected and hidden. Every surface knows which object it belongs to,
+// and parts given the same name are one object. A hidden object's distance is
+// pushed far away by a uniform, so hiding needs no recompiling.
+//
 // shape.pose('elbow') marks a joint: a rotation and position supplied from
 // JavaScript every frame, so a scene can animate without recompiling.
 //
@@ -65,14 +70,33 @@ const SDF = (() => {
   // One Ctx writes one GLSL function body. `full` selects Hit values with
   // materials rather than bare floats; every shape below works in both modes.
   class Ctx {
-    constructor(full, funcs, joints) {
+    constructor(full, funcs, joints, objects) {
       this.full = full;
       this.funcs = funcs;
       this.joints = joints;
+      this.objects = objects;
       this.lines = [];
       this.n = 0;
       this.cache = new Map();
       this.materials = [];
+      this.tagged = new Map();
+    }
+    object(name) {
+      if (!this.objects.includes(name)) this.objects.push(name);
+      return this.objects.indexOf(name);
+    }
+    // The material m, belonging to object id. One copy per pair, so memo() can
+    // still tell when a shape is reused with the same material.
+    tag(m, id) {
+      if (id === undefined || m.id === id) return m;
+      if (!this.tagged.has(m)) this.tagged.set(m, new Map());
+      const byId = this.tagged.get(m);
+      if (!byId.has(id)) byId.set(id, { ...m, id });
+      return byId.get(id);
+    }
+    // Pushes a hidden object's distance out of reach.
+    hide(v, id) {
+      return this.remap(v, (d) => `(uHidden[${id}]>.5?1e5:${d})`);
     }
     // A shape used twice at the same point is only computed once.
     memo(shape, p, m, emit) {
@@ -95,7 +119,7 @@ const SDF = (() => {
     leaf(expr, m) {
       const d = this.let('float', expr);
       if (!this.full) return d;
-      return this.let('Hit', `Hit(${d},${vec(m.color)},${f(m.rough)},${f(m.metal)},${f(m.glow)})`);
+      return this.let('Hit', `Hit(${d},${vec(m.color)},${f(m.rough)},${f(m.metal)},${f(m.glow)},${f(m.id ?? -1)})`);
     }
     // Apply a distance-only change, such as rounding, to a result.
     remap(v, fn) {
@@ -218,9 +242,18 @@ const SDF = (() => {
     }
 
     // Inner paints win over outer ones, so a group can set a default colour.
+    // Painting keeps the object the surface belongs to.
     paint(mat, ...rest) {
       const own = toMaterial(mat, ...rest);
-      return new Shape((c, p) => this.emit(c, p, own), this.d);
+      return new Shape((c, p, m) => this.emit(c, p, c.tag(own, m.id)), this.d);
+    }
+
+    // An object for the outliner. Inner names win over outer ones, as paint does.
+    named(name) {
+      return new Shape((c, p, m) => {
+        const id = c.object(name);
+        return c.hide(this.emit(c, p, c.tag(m, id)), id);
+      }, this.d);
     }
   }
 
@@ -406,6 +439,7 @@ const SDF = (() => {
   // sphere is further away than the nearest surface found so far. That can never
   // change the answer. Even so, checking every body at every ray step is slow, so
   // one lookup in a small texture of lower bounds usually skips all of them.
+  // Each body is an object of its own; a hidden one is skipped entirely.
   const withBodies = (world, bodies) => new Shape((c, p, m) => {
     // Edits change the world, not the bodies, so a pit cannot erase what falls in.
     const first = world.emit(c, p, m);
@@ -414,9 +448,10 @@ const SDF = (() => {
     c.lines.push(`if(uHideBodies<.5&&bodyLowerBound(${p})<${nearest}){`);
     bodies.forEach((body, i) => {
       const j = c.joint(`body${i}`);
-      c.lines.push(`if(length(${p}-uJointT[${j}])-${f(body.radius)}<${nearest}){`);
+      const id = c.object(body.name || `Body ${i + 1}`);
+      c.lines.push(`if(uHidden[${id}]<.5&&length(${p}-uJointT[${j}])-${f(body.radius)}<${nearest}){`);
       const q = c.let('vec3', `uJointR[${j}]*(${p}-uJointT[${j}])`);
-      const v = body.shape.emit(c, q, m);
+      const v = body.shape.emit(c, q, c.tag(m, id));
       c.lines.push(c.full ? `${out}=hUnion(${out},${v});}` : `${out}=min(${out},${v});}`);
     });
     c.lines.push('}');
@@ -428,17 +463,20 @@ const SDF = (() => {
   const compile = (shape) => {
     const funcs = [];
     const joints = [];
+    const objects = [];
     const body = (full) => {
-      const ctx = new Ctx(full, funcs, joints);
+      const ctx = new Ctx(full, funcs, joints, objects);
       const result = shape.emit(ctx, 'p', DEFAULT_MATERIAL);
       return `${ctx.lines.join('\n  ')}\n  return ${result};`;
     };
     const dist = body(false);
     const full = body(true);
     const n = joints.length;
-    const uniforms = n ? `uniform mat3 uJointR[${n}];\nuniform vec3 uJointT[${n}];\n` : '';
+    let uniforms = n ? `uniform mat3 uJointR[${n}];\nuniform vec3 uJointT[${n}];\n` : '';
+    if (objects.length) uniforms += `uniform float uHidden[${objects.length}];\n`;
     return {
       joints,
+      objects,
       code: `${uniforms}${funcs.join('\n')}
 float treeMap(vec3 p){\n  ${dist}\n}
 Hit treeHit(vec3 p){\n  ${full}\n}`,

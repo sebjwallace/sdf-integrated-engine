@@ -9,19 +9,34 @@ void main(){
   gl_Position=vec4(uv*2.-1.,0.,1.);
 }`;
 
+// Alpha holds which object each pixel shows (its index + 1, or 0 for none), so
+// the selected object can be outlined: a pixel is outline if it is not part of
+// the object but a nearby pixel is. Only visible edges are outlined.
 const PRESENT_SHADER = `#version 300 es
 precision highp float;
-uniform sampler2D tex; uniform vec2 scale;
+uniform sampler2D tex; uniform vec2 scale; uniform float uSel,uWidth;
 in vec2 uv; out vec4 o;
+float objectAt(vec2 px,vec2 size){return texelFetch(tex,ivec2(clamp(px,vec2(0),size-1.)),0).a;}
 void main(){
   vec3 c=texture(tex,uv*scale).rgb;
+  if(uSel>0.){
+    vec2 size=vec2(textureSize(tex,0))*scale,px=uv*size;
+    if(abs(objectAt(px,size)-uSel)>.5){
+      float near=0.;
+      for(int i=0;i<12;i++){
+        float a=float(i)*.5236;
+        near=max(near,abs(objectAt(px+vec2(cos(a),sin(a))*uWidth,size)-uSel)<.5?1.:0.);
+      }
+      c=mix(c,vec3(1.,.6,.15),near);
+    }
+  }
   float n=fract(52.9829189*fract(dot(gl_FragCoord.xy,vec2(.06711056,.00583715))));
   o=vec4(c+(n-.5)/255.,1.);
 }`;
 
 // Distance helpers shared by every scene. Generated map() code calls these.
 const SDF_LIBRARY = `
-struct Hit{float d;vec3 col;float rough;float metal;float glow;};
+struct Hit{float d;vec3 col;float rough;float metal;float glow;float id;};
 
 float smin(float a,float b,float k){float h=max(k-abs(a-b),0.)/k;return min(a,b)-h*h*k*.25;}
 float smax(float a,float b,float k){return k>0.?-smin(-a,-b,k):max(a,b);}
@@ -29,7 +44,7 @@ float smax(float a,float b,float k){return k>0.?-smin(-a,-b,k):max(a,b);}
 Hit hUnion(Hit a,Hit b){if(a.d<b.d)return a;return b;}
 Hit hBlend(Hit a,Hit b,float k){
   float h=clamp(.5+.5*(b.d-a.d)/k,0.,1.);
-  return Hit(smin(a.d,b.d,k),mix(b.col,a.col,h),mix(b.rough,a.rough,h),mix(b.metal,a.metal,h),mix(b.glow,a.glow,h));
+  return Hit(smin(a.d,b.d,k),mix(b.col,a.col,h),mix(b.rough,a.rough,h),mix(b.metal,a.metal,h),mix(b.glow,a.glow,h),h>.5?a.id:b.id);
 }
 Hit hSubtract(Hit a,Hit b,float k){a.d=smax(a.d,-b.d,k);return a;}
 Hit hIntersect(Hit a,Hit b,float k){float d=smax(a.d,b.d,k);if(b.d>a.d)a=b;a.d=d;return a;}
@@ -202,10 +217,11 @@ vec3 reflected(vec3 ro,vec3 rd,float blur){
   return c+F*studio(reflect(rd,n),max(m.rough,.3));
 }
 
-vec3 shadeObject(vec3 ro,vec3 rd,float t){
+vec3 shadeObject(vec3 ro,vec3 rd,float t,out float id){
   vec3 p=ro+rd*t;
   vec3 n=uHQ>.5?exactNormal(p,max(.0006,.0004*t)):normalAt(p,max(uMinEps,.0004*t));
   Hit m=mapFull(p);
+  id=m.id;
   vec3 q=p+n*.003;
   float ao=occlusion(p,n);
   float sh=max(dot(n,KEY),0.)>0.?softShadow(q,KEY,14.,uHQ>.5?40:12):0.;
@@ -272,16 +288,17 @@ vec3 shadeCut(vec3 p,vec3 rd,float t,Hit m){
   return mix(c,ink,edge);
 }
 
-vec3 shadeHit(vec3 ro,vec3 rd,float t){
+vec3 shadeHit(vec3 ro,vec3 rd,float t,out float id){
   vec3 p=ro+rd*t;
   float plane=cutPlane(p);
   // Only points on the plane can be on the cut face, which keeps this free
   // whenever nothing is being cut.
   if(plane>-(.002+.0006*t)){
     Hit m=mapFull(p);
+    id=m.id;
     if(m.d<plane+.0012*t)return shadeCut(p,rd,t,m);
   }
-  return shadeObject(ro,rd,t);
+  return shadeObject(ro,rd,t,id);
 }
 
 vec3 aces(vec3 x){return clamp(x*(2.51*x+.03)/(x*(2.43*x+.59)+.14),0.,1.);}
@@ -291,14 +308,16 @@ void main(){
   vec3 rd=normalize(uCam*vec3(ndc,FOCAL));
   float tFloor=rd.y<0.?-uEye.y/rd.y:-1.;
   float t=march(uEye,rd,uHQ>.5?128:48);
-  if(uPick>.5){fragColor=vec4(t);return;}
+  // Picking returns the distance along the ray and the object hit (index + 1).
+  if(uPick>.5){fragColor=vec4(t,t>0.?mapFull(uEye+rd*t).id+1.:0.,0,0);return;}
   vec3 c;
-  if(t>0.&&(tFloor<0.||t<tFloor))c=shadeHit(uEye,rd,t);
+  float id=-1.;
+  if(t>0.&&(tFloor<0.||t<tFloor))c=shadeHit(uEye,rd,t,id);
   else if(tFloor>0.)c=shadeFloor(uEye,rd,tFloor);
   else c=backdrop(rd);
   // Soft vignette, tone mapping, gamma.
   c*=1.-.28*dot(ndc*.55,ndc*.55);
-  fragColor=vec4(pow(aces(c),vec3(1./2.2)),1.);
+  fragColor=vec4(pow(aces(c),vec3(1./2.2)),id+1.);
 }`;
 
 const NO_EDITS = packEdits([]);
@@ -406,14 +425,20 @@ class Viewer {
     if (scene.physics) {
       const spec = scene.physics();
       this.sim = new PhysicsWorld({ world: spec.world.d });
-      for (const { shape, ...options } of spec.bodies) this.sim.add(shape, options);
-      tree = SDF.withBodies(spec.world, this.sim.bodies.map((b) => ({ shape: b.shape, radius: b.info.renderRadius })));
+      for (const { shape, name, ...options } of spec.bodies) this.sim.add(shape, options);
+      tree = SDF.withBodies(spec.world, this.sim.bodies.map((b, i) => ({
+        shape: b.shape, radius: b.info.renderRadius, name: spec.bodies[i].name,
+      })));
     } else {
       tree = scene.build();
     }
     this.toolScale = scene.toolScale || 1;
     const compiled = SDF.compile(tree);
     this.sceneCode = compiled.code;
+    // The scene's named objects, for the outliner. 1 in `hidden` hides one.
+    this.objects = compiled.objects;
+    this.hidden = new Float32Array(Math.max(1, this.objects.length));
+    this.selected = -1;
     this.animation = scene.animate ? scene : null;
     this.clock = 0;
     this.jointIndex = new Map(compiled.joints.map((name, i) => [name, i]));
@@ -693,6 +718,14 @@ class Viewer {
 
   // Asks the GPU where the pointer's ray hits the model.
   pickSurface(x, y, includeBodies = false) {
+    const out = this.pick(x, y, includeBodies);
+    if (!out || !(out[0] > 0)) return null;
+    const { eye, dir } = this.pointerRay(x, y);
+    return eye.map((v, i) => v + dir[i] * out[0]);
+  }
+
+  // Renders the one pixel under the pointer: [distance along the ray, object + 1].
+  pick(x, y, includeBodies) {
     if (!this.pickFbo) return null;
     this.pickBodies = includeBodies;
     const gl = this.gl;
@@ -706,9 +739,7 @@ class Viewer {
     this.draw(true, width, height, [px - 0.5, py - 0.5], true);
     const out = new Float32Array(4);
     gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.FLOAT, out);
-    if (!(out[0] > 0)) return null;
-    const { eye, dir } = this.pointerRay(x, y);
-    return eye.map((v, i) => v + dir[i] * out[0]);
+    return out;
   }
 
   // Nearest edit whose bounding sphere the pointer's ray passes through.
@@ -744,6 +775,34 @@ class Viewer {
     const { edit, offset } = this.grab;
     const hit = this.pickSurface(x, y);
     this.moveEdit(edit, hit ? hit.map((v, i) => v + offset[i]) : this.onDragPlane(x, y, edit.pos));
+  }
+
+  // ---- objects -----------------------------------------------------------------
+
+  select(id) {
+    this.selected = id >= 0 && id < this.objects.length ? id : -1;
+    // A finished image is not drawn again, so redraw its outline now.
+    if (this.shown) this.show(...this.shown);
+    this.onChange();
+  }
+
+  setHidden(id, hidden) {
+    this.hidden[id] = hidden ? 1 : 0;
+    if (hidden && this.selected === id) this.selected = -1;
+    // The baked grid holds the whole scene, so bake it again. Live mode shows
+    // the change at once while that happens.
+    if (!this.liveOnly && this.field) {
+      this.disposeField();
+      this.dirty = null;
+    }
+    this.restart(false);
+    this.onChange();
+  }
+
+  // The object under the pointer, or -1.
+  objectAt(x, y) {
+    const hit = this.pick(x, y, true);
+    return hit ? hit[1] - 1 : -1;
   }
 
   setQuality(scale) {
@@ -813,9 +872,12 @@ class Viewer {
     const c = this.canvas;
     const pointers = new Map();
     let pinch = 0;
+    // A press that barely moves is a click, which selects what is under it.
+    let click = null;
     c.addEventListener('pointerdown', (e) => {
       c.setPointerCapture(e.pointerId);
       pointers.set(e.pointerId, [e.clientX, e.clientY]);
+      click = pointers.size === 1 && e.button === 0 && this.tool === 'orbit' && !this.looking ? [e.clientX, e.clientY] : null;
       c.classList.add('dragging');
       pinch = 0;
       this.grab = null;
@@ -880,6 +942,11 @@ class Viewer {
       }
     });
     const release = (e) => {
+      if (click && e.type === 'pointerup' && !this.grab && Math.hypot(e.clientX - click[0], e.clientY - click[1]) < 4) {
+        const rect = c.getBoundingClientRect();
+        this.select(this.objectAt(e.clientX - rect.left, e.clientY - rect.top));
+      }
+      click = null;
       pointers.delete(e.pointerId);
       pinch = 0;
       this.grab = null;
@@ -905,7 +972,9 @@ class Viewer {
     addEventListener('keydown', (e) => {
       if (typing(e)) return;
       if ((e.key === 'Delete' || e.key === 'Backspace') && this.hover) this.removeEdit(this.hover);
-      if (e.key === 'Escape') this.setTool('orbit');
+      if (e.key === 'Escape') { this.setTool('orbit'); this.select(-1); }
+      // H hides the selected object, as in Blender.
+      if (e.code === 'KeyH' && !e.metaKey && !e.ctrlKey && !e.altKey && this.selected >= 0) this.setHidden(this.selected, true);
       if (FLY_KEYS[e.code] && !e.metaKey && !e.ctrlKey && !e.altKey) {
         this.keys.add(e.code);
         e.preventDefault();
@@ -1033,6 +1102,7 @@ class Viewer {
       gl.uniformMatrix3fv(u['uJointR[0]'], false, this.jointR);
       gl.uniform3fv(u['uJointT[0]'], this.jointT);
     }
+    if (u['uHidden[0]']) gl.uniform1fv(u['uHidden[0]'], this.hidden);
     gl.uniform1f(u.uHQ, hq ? 1 : 0);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
   }
@@ -1045,8 +1115,14 @@ class Viewer {
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
     gl.useProgram(this.present.prog);
     gl.bindTexture(gl.TEXTURE_2D, this.tex);
-    gl.uniform2f(this.present.uniforms.scale, sx, sy);
+    const u = this.present.uniforms;
+    gl.uniform2f(u.scale, sx, sy);
+    // Without float textures, alpha cannot hold object ids.
+    gl.uniform1f(u.uSel, this.floatTarget ? this.selected + 1 : 0);
+    // About 1.5 CSS pixels wide at any resolution, in rendered pixels.
+    gl.uniform1f(u.uWidth, Math.max(1, (1.5 * sx * this.canvas.width) / this.canvas.clientWidth));
     gl.drawArrays(gl.TRIANGLES, 0, 3);
+    this.shown = [sx, sy];
   }
 
   frame(now) {
@@ -1122,7 +1198,8 @@ class Viewer {
     if (n === 0) gl.disable(gl.BLEND);
     else {
       gl.enable(gl.BLEND);
-      gl.blendFunc(gl.CONSTANT_ALPHA, gl.ONE_MINUS_CONSTANT_ALPHA);
+      // Colour averages over samples; alpha keeps the first sample's object ids.
+      gl.blendFuncSeparate(gl.CONSTANT_ALPHA, gl.ONE_MINUS_CONSTANT_ALPHA, gl.ZERO, gl.ONE);
       gl.blendColor(0, 0, 0, 1 / (n + 1));
     }
     this.draw(true, w, h, jitter);

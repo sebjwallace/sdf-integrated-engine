@@ -303,6 +303,15 @@ void main(){
 
 const NO_EDITS = packEdits([]);
 
+// Fly keys by physical position (so they work on any keyboard layout):
+// [right, up, forward].
+const FLY_KEYS = {
+  KeyW: [0, 0, 1], KeyS: [0, 0, -1], KeyA: [-1, 0, 0], KeyD: [1, 0, 0],
+  KeyE: [0, 1, 0], KeyQ: [0, -1, 0],
+  ShiftLeft: [0, 0, 0], ShiftRight: [0, 0, 0],  // held for speed
+  Space: [0, 0, 0],  // held to turn the head with the pointer, see look()
+};
+
 // The shapes the edit tools place. Half-sizes are in world units.
 const TOOLS = {
   hole: { kind: 0, op: 0, size: [0.28, 0.28, 0.28], k: 0.03 },
@@ -796,7 +805,7 @@ class Viewer {
       c.classList.add('dragging');
       pinch = 0;
       this.grab = null;
-      if (pointers.size > 1 || e.button !== 0 || e.shiftKey) return;
+      if (pointers.size > 1 || e.button !== 0 || e.shiftKey || this.keys.has('Space')) return;
       if (this.tool !== 'orbit') {
         const hit = this.pickSurface(e.clientX, e.clientY);
         const edit = hit && this.addEdit(this.tool, hit);
@@ -821,6 +830,13 @@ class Viewer {
     });
     c.addEventListener('pointermove', (e) => {
       const last = pointers.get(e.pointerId);
+      // Space held: the pointer turns the head, pressed or not, so a trackpad
+      // can look around without clicking.
+      if (this.keys.has('Space') && !this.grab && !this.bodyGrab && pointers.size <= 1) {
+        if (last) { last[0] = e.clientX; last[1] = e.clientY; }
+        this.look(e.movementX, e.movementY);
+        return;
+      }
       if (!last) {
         this.hover = this.editAt(e.clientX, e.clientY);
         c.classList.toggle('over-edit', !!this.hover);
@@ -844,7 +860,9 @@ class Viewer {
         this.pan(dx, dy);
       } else {
         this.goal.theta -= dx * 0.35;
-        this.goal.phi = Math.min(88, Math.max(1.5, this.goal.phi + dy * 0.3));
+        // Looking up from below the orbit point is allowed, but orbiting will
+        // not take the camera any further below it.
+        this.goal.phi = Math.min(88, Math.max(Math.min(1.5, this.goal.phi), this.goal.phi + dy * 0.3));
       }
     });
     const release = (e) => {
@@ -866,11 +884,57 @@ class Viewer {
       else this.zoom(factor);
     }, { passive: false });
     c.addEventListener('dblclick', () => { if (!this.hover) Object.assign(this.goal, this.home); });
+    // Fly keys, as in Unity and Unreal: WASD moves, Q and E go down and up,
+    // Shift goes faster. Held keys are applied each frame in fly().
+    this.keys = new Set();
+    const typing = (e) => e.target.closest && e.target.closest('input, select, textarea, [contenteditable]');
     addEventListener('keydown', (e) => {
-      if (e.target.closest && e.target.closest('select')) return;
+      if (typing(e)) return;
       if ((e.key === 'Delete' || e.key === 'Backspace') && this.hover) this.removeEdit(this.hover);
       if (e.key === 'Escape') this.setTool('orbit');
+      if (FLY_KEYS[e.code] && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        this.keys.add(e.code);
+        e.preventDefault();
+        c.classList.toggle('looking', this.keys.has('Space'));
+      }
     });
+    addEventListener('keyup', (e) => {
+      // Stops a focused button from being pressed by the space bar.
+      if (e.code === 'Space' && this.keys.has('Space')) e.preventDefault();
+      this.keys.delete(e.code);
+      c.classList.toggle('looking', this.keys.has('Space'));
+    });
+    // A key released while the window is not focused never sends keyup.
+    addEventListener('blur', () => { this.keys.clear(); c.classList.remove('looking'); });
+  }
+
+  // Turns the camera's head: it stays where it is and its orbit point swings
+  // round in front of it. Applied to the eased camera too, so the eye does not
+  // drift while easing catches up.
+  look(dx, dy) {
+    for (const cam of [this.cam, this.goal]) {
+      const { eye } = this.basis(cam);
+      cam.theta -= dx * 0.2;
+      cam.phi = Math.min(88, Math.max(-85, cam.phi + dy * 0.2));
+      const { forward } = this.basis(cam);
+      cam.target = eye.map((v, i) => v + forward[i] * cam.dist);
+    }
+    this.restart(true);
+  }
+
+  // Moves the camera and its orbit point together, so orbiting afterwards turns
+  // around whatever is now in front of the camera.
+  fly(dt, fast) {
+    let [x, y, z] = [0, 0, 0];
+    for (const code of this.keys) {
+      const [kx, ky, kz] = FLY_KEYS[code];
+      x += kx; y += ky; z += kz;
+    }
+    if (!x && !y && !z) return;
+    const { forward, right } = this.basis(this.goal);
+    // Speed scales with the scene, so small and large models feel the same.
+    const speed = this.bound.radius * 0.6 * (fast ? 3 : 1) * (Math.min(dt, 100) / 1000);
+    this.goal.target = this.goal.target.map((v, i) => v + (forward[i] * z + right[i] * x + (i === 1 ? y : 0)) * speed);
   }
 
   zoom(factor) {
@@ -984,6 +1048,7 @@ class Viewer {
       this.sim.advance(Math.min(dt, 50) / 1000);
       this.applySimulation();
     }
+    if (this.keys.size) this.fly(dt, this.keys.has('ShiftLeft') || this.keys.has('ShiftRight'));
     if (this.ease() || animating || simulating || now < (this.activeUntil || 0)) this.restart(true);
     else if (this.moving) this.restart(false);
     if (this.moving) this.frameMs += (dt - this.frameMs) * 0.1;

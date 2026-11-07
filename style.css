@@ -88,6 +88,7 @@ output {
 
 canvas.over-edit { cursor: move; }
 canvas.placing { cursor: crosshair; }
+canvas.looking { cursor: move; }
 
 select {
   min-height: 28px;

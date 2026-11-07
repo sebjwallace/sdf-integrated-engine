@@ -7,7 +7,7 @@
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <canvas id="view" aria-label="3D view. Drag to rotate, scroll to zoom."></canvas>
+  <canvas id="view" aria-label="3D view. Drag to rotate, scroll to zoom, WASD to fly."></canvas>
   <header>
     <div class="row">
       <label for="scene">Scene</label>
@@ -46,7 +46,7 @@
     </div>
     <p id="stats" aria-live="off"></p>
   </header>
-  <p id="hint">Drag to rotate · Scroll to zoom · Shift-drag to pan · Double-click to reset<span id="edit-hints"> · Pick a tool, then press on the model · Drag an edit to move it · Scroll over it to resize · Delete removes it</span><span id="physics-hint" hidden> · Drag a body to throw it</span></p>
+  <p id="hint">Drag to rotate · Scroll to zoom · Shift-drag to pan · WASD to fly, Q/E down/up, Shift for speed, hold Space and move to look around · Double-click to reset<span id="edit-hints"> · Pick a tool, then press on the model · Drag an edit to move it · Scroll over it to resize · Delete removes it</span><span id="physics-hint" hidden> · Drag a body to throw it</span></p>
   <p id="error" role="alert" hidden></p>
 
   <script src="sdf.js"></script>
